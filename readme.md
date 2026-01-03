@@ -25,6 +25,11 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Export**: Export your playlist to CSV format for external analysis.
 *   **Dark Mode**: Toggle between Light and Dark themes.
 
+## Demo
+
+![M3U Editor Demo](m3u-editor-demo.gif)
+*Visual overview of the application features.*
+
 ## Prerequisites
 
 *   Python 3.x
