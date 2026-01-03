@@ -1,1 +1,6 @@
 /.qodo
+/backups/
+*.zip
+*.log
+*.csv
+__pycache__/
