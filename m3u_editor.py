@@ -11,7 +11,12 @@ import urllib.parse
 import copy
 import xml.etree.ElementTree as ET
 import time
+import xml.etree.ElementTree as ET
+import time
 import logging
+import gzip
+import lzma
+from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional, Iterable, Dict, Any
 from performance_utils import ThrottledLogoLoader, EfficientUndoStack, FastM3UParser
@@ -268,66 +273,123 @@ class LogoScraperWorker(QRunnable):
 class EPGSignals(QObject):
     finished = pyqtSignal(dict, int) # data_map, count
     error = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
 class EPGWorker(QRunnable):
-    """Worker to fetch and parse XMLTV data."""
-    def __init__(self, url):
+    """Worker to fetch and parse XMLTV data (XML, GZ, XZ) from multiple sources."""
+    def __init__(self, urls):
         super().__init__()
-        self.url = url
+        self.urls = urls if isinstance(urls, list) else [urls]
         self.signals = EPGSignals()
 
     def run(self):
+        epg_data = {
+            "channels": {}, # id -> {name, logo}
+            "programs": {}  # id -> list of programs
+        }
+        
         try:
-            # Download XML
-            with urllib.request.urlopen(self.url, timeout=30) as response:
-                xml_data = response.read()
-            
-            # Parse XML
-            root = ET.fromstring(xml_data)
-            
-            # Map: Display Name -> {id, icon}
-            epg_map = {}
-            count = 0
-            
-            for channel in root.findall('channel'):
-                chn_id = channel.get('id')
-                display_name = channel.find('display-name')
-                icon = channel.find('icon')
+            total_urls = len(self.urls)
+            for i, url in enumerate(self.urls):
+                if not url: continue
                 
-                if display_name is not None and display_name.text:
-                    name = display_name.text.strip()
-                    icon_src = icon.get('src') if icon is not None else ""
-                    epg_map[name] = {'id': chn_id, 'logo': icon_src}
-                    count += 1
-            
-            self.signals.finished.emit(epg_map, count)
+                self.signals.progress.emit(f"Fetching source {i+1}/{total_urls}...")
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=60) as response:
+                        raw_data = response.read()
+                    
+                    self.signals.progress.emit(f"Decompressing source {i+1}...")
+                    if url.endswith(".gz"):
+                        xml_data = gzip.decompress(raw_data)
+                    elif url.endswith(".xz"):
+                        xml_data = lzma.decompress(raw_data)
+                    else:
+                        xml_data = raw_data
+                    
+                    self.signals.progress.emit(f"Parsing source {i+1}...")
+                    root = ET.fromstring(xml_data)
+                    
+                    # Parse Channels
+                    for channel in root.findall('channel'):
+                        chn_id = channel.get('id')
+                        display_name = channel.find('display-name')
+                        icon = channel.find('icon')
+                        
+                        name = display_name.text.strip() if display_name is not None else chn_id
+                        logo = icon.get('src') if icon is not None else ""
+                        
+                        epg_data["channels"][chn_id] = {"name": name, "logo": logo}
+                    
+                    # Parse Programs
+                    for prog in root.findall('programme'):
+                        chn_id = prog.get('channel')
+                        start_str = prog.get('start')
+                        stop_str = prog.get('stop')
+                        title_elem = prog.find('title')
+                        desc_elem = prog.find('desc')
+                        
+                        if not chn_id or not start_str or title_elem is None:
+                            continue
+                        
+                        # XMLTV format: YYYYMMDDHHMMSS +HHMM
+                        try:
+                            start_dt = datetime.strptime(start_str.split()[0], "%Y%m%d%H%M%S")
+                            stop_dt = datetime.strptime(stop_str.split()[0], "%Y%m%d%H%M%S") if stop_str else None
+                        except ValueError:
+                            continue
+                        
+                        program = {
+                            "start": start_dt,
+                            "stop": stop_dt,
+                            "title": title_elem.text,
+                            "desc": desc_elem.text if desc_elem is not None else ""
+                        }
+                        
+                        if chn_id not in epg_data["programs"]:
+                            epg_data["programs"][chn_id] = []
+                        epg_data["programs"][chn_id].append(program)
+                        
+                except Exception as e:
+                    logging.error(f"Failed to process EPG source {url}: {e}")
+                    continue
+
+            # Sort programs by start time
+            for chn_id in epg_data["programs"]:
+                epg_data["programs"][chn_id].sort(key=lambda x: x["start"])
+                
+            self.signals.finished.emit(epg_data, len(epg_data["channels"]))
             
         except Exception as e:
+            logging.error(f"EPGWorker failed: {e}", exc_info=True)
             self.signals.error.emit(str(e))
 
-class RepairWorker(ValidationWorker):
-    """Worker to attempt repairing a broken stream."""
-    def run(self):
-        try:
-            # 1. Try Protocol Swap (http <-> https)
-            new_url = None
-            if self.url.startswith("http://"):
-                new_url = self.url.replace("http://", "https://", 1)
-            elif self.url.startswith("https://"):
-                new_url = self.url.replace("https://", "http://", 1)
-                
-            if new_url:
-                is_valid, msg = self.check_url(new_url, self.user_agent)
-                if is_valid:
-                    self.signals.result.emit(self.row_index, True, new_url) # Return new URL as message
-                    self.signals.finished.emit()
-                    return
-
-            self.signals.result.emit(self.row_index, False, "Repair failed")
-        except Exception as e:
-            logging.error(f"RepairWorker failed for row {self.row_index}: {e}", exc_info=True)
-        finally:
-            self.signals.finished.emit()
+class EPGManager:
+    """Manages EPG data and provides query methods."""
+    def __init__(self):
+        self.channels = {} # id -> {name, logo}
+        self.programs = {} # id -> list of programs
+        
+    def set_data(self, data):
+        self.channels = data.get("channels", {})
+        self.programs = data.get("programs", {})
+        
+    def get_current_program(self, tvg_id, channel_name=None):
+        """Returns the current program for a given channel ID or name."""
+        now = datetime.now()
+        
+        # Try by ID first
+        if tvg_id and tvg_id in self.programs:
+            for prog in self.programs[tvg_id]:
+                if prog["start"] <= now <= prog["stop"]:
+                    return prog
+                    
+        # Try by name (fuzzy match or direct lookup if we had a name map)
+        # For now, just return None if ID fails
+        return None
+        
+    def get_programs(self, tvg_id):
+        return self.programs.get(tvg_id, [])
 
 class ResolutionSignals(QObject):
     result = pyqtSignal(int, str) # row_index, resolution
@@ -583,6 +645,34 @@ class PlaylistModel(QAbstractTableModel):
             self.entries.insert(target_row, item)
         self.endResetModel()
 
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        
+        flags = super().flags(index)
+        # Allow editing for Name column (1)
+        if index.column() == 1:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not index.isValid():
+            return False
+            
+        row = index.row()
+        col = index.column()
+        
+        logging.debug(f"Model setData: row={row}, col={col}, role={role}, value={value}")
+
+        if 0 <= row < len(self.entries):
+            entry = self.entries[row]
+            if col == 1: # Name
+                entry.name = value
+                self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole])
+                return True
+                
+        return False
+
 class PlaylistProxyModel(QSortFilterProxyModel):
     """Proxy model for filtering and sorting."""
     def __init__(self, parent=None):
@@ -602,6 +692,16 @@ class PlaylistProxyModel(QSortFilterProxyModel):
         group_match = (self.filter_group == "All Groups" or entry.group == self.filter_group)
         
         return name_match and group_match
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return self.sourceModel().flags(self.mapToSource(index))
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        logging.debug(f"Proxy setData: index={index.row()},{index.column()} value={value}")
+        source_index = self.mapToSource(index)
+        return self.sourceModel().setData(source_index, value, role)
 
 class PlaylistTable(QTableView):
     """Custom TableWidget to handle Drag and Drop reordering."""
@@ -965,6 +1065,20 @@ class StreamPreviewDialog(QDialog):
         self.storyboard_widget = StoryboardWidget(self.entry.url)
         self.tabs.addTab(self.storyboard_widget, "Storyboard")
         
+        # --- EPG Schedule Tab ---
+        self.epg_tab = QWidget()
+        epg_layout = QVBoxLayout(self.epg_tab)
+        
+        self.epg_list = QListWidget()
+        self.epg_list.setStyleSheet("""
+            QListWidget { background-color: #1e1e2e; border: 1px solid #313244; border-radius: 8px; }
+            QListWidget::item { padding: 10px; border-bottom: 1px solid #313244; }
+            QListWidget::item:selected { background-color: #313244; }
+        """)
+        epg_layout.addWidget(self.epg_list)
+        
+        self.tabs.addTab(self.epg_tab, "EPG Schedule")
+        
         # Media Player Setup
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -998,6 +1112,20 @@ class StreamPreviewDialog(QDialog):
         
         # Update Security Status
         if self.parent() and hasattr(self.parent(), 'model'):
+            # Security
+            security_data = self.parent().model.security_data.get(id(self.entry))
+            if security_data:
+                is_secure = security_data.get("is_secure", False)
+                summary = security_data.get("summary", "Unknown")
+                color = "#a6e3a1" if is_secure else "#f38ba8"
+                self.lbl_security.setText(summary)
+                self.lbl_security.setStyleSheet(f"color: {color}; font-weight: bold;")
+            else:
+                self.lbl_security.setText("Not Audited")
+                self.lbl_security.setStyleSheet("color: #6c7086;")
+                
+            # EPG
+            self.update_epg_schedule()
             audit = self.parent().model.security_data.get(id(self.entry))
             if audit:
                 self.lbl_security.setText(audit["summary"])
@@ -1108,6 +1236,57 @@ class StreamPreviewDialog(QDialog):
         self.video_widget.setVisible(False)
         logging.error(f"Playback error: {error_str}")
 
+    def update_epg_schedule(self):
+        """Updates the EPG schedule list for the current channel."""
+        self.epg_list.clear()
+        
+        if not self.parent() or not hasattr(self.parent(), 'epg_manager'):
+            self.epg_list.addItem("EPG Manager not available.")
+            return
+
+        manager = self.parent().epg_manager
+        if not manager:
+            self.epg_list.addItem("EPG data not loaded.")
+            return
+
+        # Try to find programs by ID first, then name
+        programs = manager.get_programs(self.entry.tvg_id)
+        if not programs:
+            # Fallback to name search if implemented in manager, or just try direct lookup
+            # For now, EPGManager.get_programs only looks up by ID in the current implementation
+            # We could enhance EPGManager later to support name lookup
+            pass
+            
+        if not programs:
+            self.epg_list.addItem("No EPG data found for this channel.")
+            return
+
+        now = datetime.now()
+        
+        for prog in programs:
+            start_fmt = prog["start"].strftime("%H:%M")
+            stop_fmt = prog["stop"].strftime("%H:%M") if prog["stop"] else "?"
+            title = prog["title"]
+            desc = prog.get("desc", "")
+            
+            item_text = f"[{start_fmt} - {stop_fmt}] {title}"
+            item = QListWidgetItem(item_text)
+            
+            # Highlight current program
+            if prog["start"] <= now <= (prog["stop"] or now):
+                item.setBackground(QColor("#313244"))
+                item.setForeground(QColor("#50fa7b")) # Green for current
+                item.setText(f"▶ {item_text}")
+                
+            item.setToolTip(desc)
+            self.epg_list.addItem(item)
+            
+        # Scroll to current item
+        for i in range(self.epg_list.count()):
+            if "▶" in self.epg_list.item(i).text():
+                self.epg_list.scrollToItem(self.epg_list.item(i))
+                break
+
     def closeEvent(self, event):
         self.player.stop()
         self.storyboard_widget.cleanup()
@@ -1207,6 +1386,62 @@ class ManageGroupsDialog(QDialog):
             self.groups_modified = True
             self.refresh_group_list()
             QMessageBox.information(self, "Success", f"Cleared group for {count} channels.")
+
+class EPGSelectionDialog(QDialog):
+    def __init__(self, parent=None, current_urls=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select EPG Sources")
+        self.resize(500, 400)
+        self.selected_urls = current_urls or []
+        
+        layout = QVBoxLayout(self)
+        
+        # Presets
+        layout.addWidget(QLabel("Preset Sources:"))
+        self.presets = [
+            ("Global Entertainment (PlutoTV)", "https://i.mjh.nz/PlutoTV/all.xml"),
+            ("Indian Channels (Samsung TV+)", "https://i.mjh.nz/SamsungTVPlus/in.xml"),
+            ("US News/Sports (Samsung TV+)", "https://i.mjh.nz/SamsungTVPlus/us.xml"),
+            ("Global Sports (IPTV-Org)", "https://iptv-org.github.io/epg/guides/int.xml"),
+            ("Indian Channels (IPTV-Org)", "https://iptv-org.github.io/epg/guides/in.xml")
+        ]
+        
+        self.check_boxes = []
+        for name, url in self.presets:
+            cb = QCheckBox(name)
+            if url in self.selected_urls:
+                cb.setChecked(True)
+            self.check_boxes.append((cb, url))
+            layout.addWidget(cb)
+            
+        # Custom URL
+        layout.addWidget(QLabel("Custom URL (optional):"))
+        self.custom_input = QLineEdit()
+        # If there's a URL in selected_urls that isn't a preset, put it here
+        preset_urls = [p[1] for p in self.presets]
+        for url in self.selected_urls:
+            if url not in preset_urls:
+                self.custom_input.setText(url)
+                break
+        layout.addWidget(self.custom_input)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_urls(self):
+        urls = []
+        for cb, url in self.check_boxes:
+            if cb.isChecked():
+                urls.append(url)
+        
+        custom = self.custom_input.text().strip()
+        if custom:
+            urls.append(custom)
+            
+        return urls
 
 class StatisticsDialog(QDialog):
     def __init__(self, parent=None, entries=None, validation_data=None):
@@ -1384,7 +1619,13 @@ class M3UEditorWindow(QMainWindow):
         self.is_dark_mode = True # Default to dark mode for "fancy" look
         self.settings = QSettings("OpenSource", "M3UEditor")
         self.recent_files = self.settings.value("recent_files", [], type=list)
-        self.epg_url = ""
+        self.settings = QSettings("OpenSource", "M3UEditor")
+        self.recent_files = self.settings.value("recent_files", [], type=list)
+        self.epg_urls = self.settings.value("epg_urls", [], type=list)
+        # Migration from single url
+        old_url = self.settings.value("epg_url", "")
+        if old_url and not self.epg_urls:
+            self.epg_urls = [old_url]
         
         # Media Player Setup
         self.player = QMediaPlayer()
@@ -1434,6 +1675,11 @@ class M3UEditorWindow(QMainWindow):
         self.btn_stop.setToolTip("Stop all background processes")
         self.btn_stop.clicked.connect(self.stop_background_tasks)
         self.btn_stop.setEnabled(False)
+        
+        self.btn_epg = QPushButton("Load EPG")
+        self.btn_epg.setToolTip("Load Electronic Program Guide (XMLTV)")
+        self.btn_epg.clicked.connect(self.prompt_epg_url)
+        toolbar.addWidget(self.btn_epg)
         
         self.btn_save = QPushButton("Save")
         self.btn_save.setToolTip("Save changes to current file")
@@ -1487,6 +1733,7 @@ class M3UEditorWindow(QMainWindow):
         self.table = PlaylistTable()
         self.model = PlaylistModel(self.entries)
         self.model.request_logo.connect(self.fetch_logo) # Connect logo fetcher
+        self.model.dataChanged.connect(lambda: self.set_modified(True))
         
         self.proxy_model = PlaylistProxyModel()
         self.proxy_model.setSourceModel(self.model)
@@ -1972,11 +2219,30 @@ class M3UEditorWindow(QMainWindow):
             return
             
         try:
+            # Create backup before saving
+            self.create_backup("quick_save")
+            
+            # Save file
             M3UParser.save_file(self.current_file_path, self.entries)
+            
+            # Verify save
+            found = False
+            with open(self.current_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                # Check for a known modified value if possible, or just check size/timestamp
+                # For debugging, let's check if the first entry name matches what we have in memory
+                if self.entries and self.entries[0].name in content:
+                    found = True
+                    
+            if not found and self.entries:
+                logging.warning("Verification failed: First entry name not found in saved file!")
+            
             self.set_modified(False)
             self.status_label.setText(f"Saved to {self.current_file_path}")
             self.log_action(f"Quick saved file: {os.path.basename(self.current_file_path)}")
+            
         except Exception as e:
+            logging.error(f"Quick save failed: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Could not save file: {str(e)}")
 
     def open_group_manager(self):
@@ -2232,6 +2498,73 @@ class M3UEditorWindow(QMainWindow):
             self.status_label.setText("Security audit complete.")
             self.log_action("Security audit completed")
             QMessageBox.information(self, "Success", "Security audit complete.")
+        
+    def prompt_epg_url(self):
+        """Prompts the user for EPG sources."""
+        dialog = EPGSelectionDialog(self, self.epg_urls)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            urls = dialog.get_urls()
+            if not urls:
+                # Default fallback if nothing selected but they clicked OK
+                # Or maybe just warn? Let's use the Indian/Global default as requested
+                reply = QMessageBox.question(self, "No Sources Selected", 
+                                           "No sources selected. Use default Indian/Global sources?",
+                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply == QMessageBox.StandardButton.Yes:
+                    urls = [
+                        "https://i.mjh.nz/PlutoTV/all.xml",
+                        "https://i.mjh.nz/SamsungTVPlus/in.xml"
+                    ]
+                else:
+                    return
+
+            self.epg_urls = urls
+            self.settings.setValue("epg_urls", self.epg_urls)
+            self.load_epg()
+
+    def load_epg(self):
+        """Starts the EPG worker to fetch and parse data."""
+        if not self.epg_urls:
+            return
+            
+        self.status_label.setText(f"Loading EPG from {len(self.epg_urls)} sources...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0) # Indeterminate
+        self.btn_epg.setEnabled(False)
+        
+        worker = EPGWorker(self.epg_urls)
+        worker.signals.finished.connect(self.on_epg_loaded)
+        worker.signals.error.connect(lambda err: self.status_label.setText(f"EPG Error: {err}"))
+        worker.signals.progress.connect(self.status_label.setText)
+        # Reset UI on error
+        worker.signals.error.connect(lambda: self.btn_epg.setEnabled(True))
+        worker.signals.error.connect(lambda: self.progress_bar.setVisible(False))
+        
+        self.thread_pool.start(worker)
+
+    def on_epg_loaded(self, data):
+        """Handles successful EPG data loading."""
+        self.epg_manager.set_data(data)
+        self.model.layoutChanged.emit() # Refresh all views
+        
+        count = len(data["channels"])
+        progs = sum(len(p) for p in data["programs"].values())
+        
+        # Calculate how many playlist entries actually have EPG data now
+        matched_count = 0
+        for entry in self.entries:
+            if self.epg_manager.get_current_program(entry.tvg_id, entry.name):
+                matched_count += 1
+        
+        self.status_label.setText(f"EPG Loaded: {count} channels, {progs} programs. Matched to {matched_count} playlist entries.")
+        self.progress_bar.setVisible(False)
+        self.btn_epg.setEnabled(True)
+        
+        msg = (f"Successfully loaded EPG data.\n\n"
+               f"EPG Channels: {count}\n"
+               f"Total Programs: {progs}\n"
+               f"Matched Playlist Entries: {matched_count}")
+        QMessageBox.information(self, "EPG Loaded", msg)
         
 
     def update_current_entry_data(self):
