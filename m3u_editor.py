@@ -2521,50 +2521,102 @@ class M3UEditorWindow(QMainWindow):
         self.log_action(f"Updated EPG data for {matched} channels")
         
     def smart_group_channels(self):
+        """
+        Categorizes channels based on their names using robust regex matching.
+        Includes expanded categories, resolution detection, and country detection.
+        """
         categories = {
-            "Sports": ["sport", "espn", "nba", "nfl", "soccer", "football", "tennis", "golf", "f1", "racing", "beinsports"],
-            "News": ["news", "cnn", "bbc", "msnbc", "fox", "al jazeera", "weather", "info"],
-            "Movies": ["movie", "film", "cinema", "hbo", "starz", "showtime", "drama", "action", "comedy", "thriller"],
-            "Kids": ["cartoon", "disney", "nick", "animation", "anime", "kids", "baby", "jr"],
-            "Music": ["music", "mtv", "vh1", "radio", "hits", "pop", "rock", "dance"],
-            "Documentary": ["docu", "history", "discovery", "nat geo", "planet", "wild", "science"]
+            "Sports": [r"sport", r"espn", r"nba", r"nfl", r"soccer", r"football", r"tennis", r"golf", r"f1", r"racing", r"beinsports", r"sky\s*sports", r"bt\s*sport", r"euro\s*sport"],
+            "News": [r"news", r"cnn", r"bbc", r"msnbc", r"fox\s*news", r"al\s*jazeera", r"weather", r"info", r"bloomberg", r"cnbc"],
+            "Movies": [r"movie", r"film", r"cinema", r"hbo", r"starz", r"showtime", r"drama", r"action", r"comedy", r"thriller", r"cine", r"mgm", r"paramount"],
+            "Kids": [r"cartoon", r"disney", r"nick", r"animation", r"anime", r"kids", r"baby", r"jr", r"boing", r"cbeebies"],
+            "Music": [r"music", r"mtv", r"vh1", r"radio", r"hits", r"pop", r"rock", r"dance", r"tmf", r"box\s*hits"],
+            "Documentary": [r"docu", r"history", r"discovery", r"nat\s*geo", r"planet", r"wild", r"science", r"animal", r"explorer"],
+            "Entertainment": [r"ent", r"show", r"variety", r"reality", r"e!", r"tlc", r"bravo", r"itv", r"abc", r"cbs", r"nbc"],
+            "Lifestyle": [r"life", r"style", r"fashion", r"food", r"cook", r"travel", r"home", r"garden", r"hgtv"],
+            "Religion": [r"relig", r"church", r"god", r"bible", r"islam", r"christian", r"faith", r"peace"],
+            "Adult": [r"xxx", r"adult", r"porn", r"sex", r"blue", r"hustler", r"playboy", r"penthouse", r"brazzers"]
         }
-        
+
+        # Resolution keywords
+        resolutions = {
+            "4K": [r"4k", r"uhd"],
+            "HD": [r"hd", r"1080p", r"720p", r"fhd"],
+            "SD": [r"sd", r"480p", r"576p"]
+        }
+
+        # Country flags for detection
+        country_flags = {
+            "US": "🇺🇸", "USA": "🇺🇸", "UK": "🇬🇧", "CA": "🇨🇦", "FR": "🇫🇷", "DE": "🇩🇪", 
+            "IT": "🇮🇹", "ES": "🇪🇸", "BR": "🇧🇷", "RU": "🇷🇺", "JP": "🇯🇵", "CN": "🇨🇳", 
+            "IN": "🇮🇳", "AU": "🇦🇺", "TR": "🇹🇷", "PL": "🇵🇱", "NL": "🇳🇱", "MX": "🇲🇽"
+        }
+
         reply = QMessageBox.question(self, "Smart Grouping", 
-                                     "This will categorize channels based on their names.\n"
-                                     "Existing groups will be overwritten only if a match is found.\n\n"
-                                     "Continue?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                                     "This will categorize channels based on their names using advanced matching.\n"
+                                     "Existing groups will be updated if a match is found.\n\n"
+                                     "Include resolution in group name? (e.g. Sports [HD])",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
         
-        if reply != QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.StandardButton.Cancel:
             return
             
-        self.create_backup("smart_group")
+        include_res = (reply == QMessageBox.StandardButton.Yes)
+        
+        self.create_backup("smart_group_v2")
         self.save_undo_state()
         count = 0
         
         try:
             for entry in self.entries:
-                name_lower = entry.name.lower()
-                found_group = None
-                
-                for category, keywords in categories.items():
-                    for keyword in keywords:
-                        if keyword in name_lower:
-                            found_group = category
+                name = entry.name
+                name_lower = name.lower()
+                found_category = None
+                found_res = ""
+                found_country = ""
+
+                # 1. Detect Category
+                for category, patterns in categories.items():
+                    for pattern in patterns:
+                        if re.search(r'\b' + pattern + r'\b', name_lower):
+                            found_category = category
                             break
-                    if found_group:
+                    if found_category:
                         break
-                
-                if found_group:
-                    if entry.group != found_group:
-                        entry.group = found_group
+
+                # 2. Detect Resolution (if requested)
+                if include_res:
+                    for res, patterns in resolutions.items():
+                        for pattern in patterns:
+                            if re.search(r'\b' + pattern + r'\b', name_lower):
+                                found_res = res
+                                break
+                        if found_res:
+                            break
+
+                # 3. Detect Country (simple check)
+                for country, flag in country_flags.items():
+                    if re.search(r'\b' + re.escape(country) + r'\b', name.upper()):
+                        found_country = flag
+                        break
+
+                # 4. Apply Grouping
+                if found_category:
+                    new_group = found_category
+                    if found_country:
+                        new_group = f"{found_country} {new_group}"
+                    if found_res:
+                        new_group = f"{new_group} [{found_res}]"
+                    
+                    if entry.group != new_group:
+                        entry.group = new_group
                         count += 1
                         
             self.refresh_table()
             self.update_group_combo()
+            self.set_modified(True)
             QMessageBox.information(self, "Success", f"Categorized {count} channels.")
-            self.log_action(f"Smart Grouping categorized {count} channels")
+            self.log_action(f"Smart Grouping (V2) categorized {count} channels")
         except Exception as e:
             logging.error(f"Smart Grouping failed: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Smart Grouping failed: {str(e)}")
@@ -2853,6 +2905,10 @@ class M3UEditorWindow(QMainWindow):
         fav_action = QAction("Add to Favorites", self)
         fav_action.triggered.connect(self.add_to_favorites)
         menu.addAction(fav_action)
+        
+        edit_group_action = QAction("Edit Group", self)
+        edit_group_action.triggered.connect(self.bulk_edit_group)
+        menu.addAction(edit_group_action)
         
         menu.addSeparator()
         
