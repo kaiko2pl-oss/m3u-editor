@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect,
     QMenu, QComboBox, QDialog, QDialogButtonBox, QCheckBox, QTabWidget,
     QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem,
-    QSlider, QStyle
+    QSlider, QStyle, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
                           QEasingCurve, QAbstractAnimation, QSettings, QAbstractTableModel,
@@ -893,6 +893,165 @@ class StreamPreviewDialog(QDialog):
         self.storyboard_widget.cleanup()
         super().closeEvent(event)
 
+class SaveOptionsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save Options")
+        layout = QVBoxLayout(self)
+        self.combo = QComboBox()
+        self.combo.addItems(["utf-8", "utf-8-sig", "latin-1", "cp1252"])
+        layout.addWidget(QLabel("Select Encoding:"))
+        layout.addWidget(self.combo)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_encoding(self):
+        return self.combo.currentText()
+
+class FindReplaceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Find and Replace")
+        layout = QFormLayout(self)
+        self.find_input = QLineEdit()
+        self.replace_input = QLineEdit()
+        self.field_combo = QComboBox()
+        self.field_combo.addItems(["Name", "Group", "URL", "Logo", "Tvg-ID", "Tvg-Chno", "User-Agent"])
+        self.case_check = QCheckBox("Case Sensitive")
+        layout.addRow("Find:", self.find_input)
+        layout.addRow("Replace:", self.replace_input)
+        layout.addRow("Field:", self.field_combo)
+        layout.addRow(self.case_check)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_data(self):
+        return (self.find_input.text(), self.replace_input.text(), 
+                self.field_combo.currentText(), self.case_check.isChecked())
+
+class ChannelNumberingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Channel Numbering")
+        layout = QFormLayout(self)
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(1, 99999)
+        self.sort_check = QCheckBox("Sort by Group/Name first")
+        self.reset_check = QCheckBox("Reset numbering per group")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Update tvg-chno", "Prefix Name (e.g. 1. Name)"])
+        layout.addRow("Start Number:", self.start_spin)
+        layout.addRow(self.sort_check)
+        layout.addRow(self.reset_check)
+        layout.addRow("Target Mode:", self.mode_combo)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_settings(self):
+        return (self.start_spin.value(), self.sort_check.isChecked(), 
+                self.reset_check.isChecked(), self.mode_combo.currentIndex())
+
+class ManageGroupsDialog(QDialog):
+    """Dialog to add, rename, and delete groups across the entire playlist."""
+    def __init__(self, entries, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Groups")
+        self.resize(400, 500)
+        self.entries = entries
+        self.groups_modified = False
+        
+        layout = QVBoxLayout(self)
+        
+        self.group_list = QListWidget()
+        self.refresh_group_list()
+        layout.addWidget(QLabel("Existing Groups:"))
+        layout.addWidget(self.group_list)
+        
+        btn_layout = QHBoxLayout()
+        
+        btn_add = QPushButton("Add Group")
+        btn_add.clicked.connect(self.add_group)
+        
+        btn_rename = QPushButton("Rename Group")
+        btn_rename.clicked.connect(self.rename_group)
+        
+        btn_delete = QPushButton("Delete Group")
+        btn_delete.clicked.connect(self.delete_group)
+        
+        btn_layout.addWidget(btn_add)
+        btn_layout.addWidget(btn_rename)
+        btn_layout.addWidget(btn_delete)
+        layout.addLayout(btn_layout)
+        
+        # Close button
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def refresh_group_list(self):
+        self.group_list.clear()
+        unique_groups = sorted(list(set(e.group for e in self.entries if e.group)))
+        self.group_list.addItems(unique_groups)
+
+    def add_group(self):
+        new_group, ok = QInputDialog.getText(self, "Add Group", "Enter new group name:")
+        if ok and new_group:
+            # Adding a group doesn't change entries until one is assigned, 
+            # but we can show it in the list if we want. 
+            # For now, we'll just inform the user to assign it to a channel.
+            QMessageBox.information(self, "Add Group", 
+                                    f"Group '{new_group}' added. Assign it to channels in the editor.")
+            self.groups_modified = True
+
+    def rename_group(self):
+        current_item = self.group_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Warning", "Please select a group to rename.")
+            return
+            
+        old_name = current_item.text()
+        new_name, ok = QInputDialog.getText(self, "Rename Group", f"Rename '{old_name}' to:", text=old_name)
+        
+        if ok and new_name and new_name != old_name:
+            count = 0
+            for entry in self.entries:
+                if entry.group == old_name:
+                    entry.group = new_name
+                    count += 1
+            
+            self.groups_modified = True
+            self.refresh_group_list()
+            QMessageBox.information(self, "Success", f"Renamed group in {count} channels.")
+
+    def delete_group(self):
+        current_item = self.group_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Warning", "Please select a group to delete.")
+            return
+            
+        group_name = current_item.text()
+        confirm = QMessageBox.question(self, "Delete Group", 
+                                       f"Are you sure you want to delete the group '{group_name}'?\n"
+                                       "Channels in this group will have their group cleared.",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if confirm == QMessageBox.StandardButton.Yes:
+            count = 0
+            for entry in self.entries:
+                if entry.group == group_name:
+                    entry.group = ""
+                    count += 1
+            
+            self.groups_modified = True
+            self.refresh_group_list()
+            QMessageBox.information(self, "Success", f"Cleared group for {count} channels.")
+
 class StatisticsDialog(QDialog):
     def __init__(self, parent=None, entries=None, validation_data=None):
         super().__init__(parent)
@@ -1063,6 +1222,7 @@ class M3UEditorWindow(QMainWindow):
         self.validation_pending_count = 0
         self.scrape_pending_count = 0
         self.undo_stack = EfficientUndoStack(max_depth=50)
+        self.is_modified = False
         self.editing_started = False
         self.is_dark_mode = True # Default to dark mode for "fancy" look
         self.settings = QSettings("OpenSource", "M3UEditor")
@@ -1114,6 +1274,12 @@ class M3UEditorWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_background_tasks)
         self.btn_stop.setEnabled(False)
         
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setToolTip("Save changes to current file")
+        self.btn_save.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.btn_save.clicked.connect(self.quick_save)
+        self.btn_save.setEnabled(False)
+        
         self.btn_reload = QPushButton("Reload")
         self.btn_reload.setToolTip("Reload current file from disk")
         self.btn_reload.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
@@ -1134,7 +1300,14 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
         toolbar.addWidget(self.btn_stop)
+        toolbar.addWidget(self.btn_save)
         toolbar.addWidget(self.btn_reload)
+        
+        btn_manage_groups = QPushButton("Manage Groups")
+        btn_manage_groups.setToolTip("Add, Rename, or Delete Groups")
+        btn_manage_groups.clicked.connect(self.open_group_manager)
+        toolbar.addWidget(btn_manage_groups)
+        
         toolbar.addStretch()
         toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self.group_combo)
@@ -1507,6 +1680,7 @@ class M3UEditorWindow(QMainWindow):
             self.model.entries = self.entries
             self.refresh_table(clear_cache=False)
             self.update_group_combo()
+            self.set_modified(True)
             self.log_action("Undo performed")
         else:
             self.status_label.setText("Nothing to undo.")
@@ -1518,6 +1692,7 @@ class M3UEditorWindow(QMainWindow):
             self.model.entries = self.entries
             self.refresh_table(clear_cache=False)
             self.update_group_combo()
+            self.set_modified(True)
             self.log_action("Redo performed")
         else:
             self.status_label.setText("Nothing to redo.")
@@ -1542,7 +1717,7 @@ class M3UEditorWindow(QMainWindow):
                 self.model.entries = self.entries # Update model reference
                 self.current_file_path = file_name
                 self.current_url = None
-                self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(file_name)}")
+                self.set_modified(False)
                 self.add_recent_file(file_name)
                 self.refresh_table()
                 self.update_group_combo()
@@ -1588,7 +1763,7 @@ class M3UEditorWindow(QMainWindow):
             self.model.entries = self.entries
             self.current_file_path = path
             self.current_url = None
-            self.setWindowTitle(f"Open Source M3U Editor - {os.path.basename(path)}")
+            self.set_modified(False)
             self.add_recent_file(path)
             self.refresh_table()
             self.update_group_combo()
@@ -1610,6 +1785,46 @@ class M3UEditorWindow(QMainWindow):
         else:
             QMessageBox.information(self, "Reload", "No source is currently open to reload.")
 
+    def set_modified(self, modified: bool):
+        """Sets the modified state and updates the UI accordingly."""
+        self.is_modified = modified
+        # Enable save button only if modified AND it's a local file (not a URL)
+        self.btn_save.setEnabled(modified and self.current_file_path is not None)
+        
+        title = "Open Source M3U Editor"
+        if self.current_file_path:
+            title += f" - {os.path.basename(self.current_file_path)}"
+        elif self.current_url:
+            title += " - URL Stream"
+            
+        if modified:
+            title += " *"
+        self.setWindowTitle(title)
+
+    def quick_save(self):
+        """Saves changes to the currently open local file."""
+        if not self.current_file_path:
+            QMessageBox.warning(self, "Save", "No local file is open to save.")
+            return
+            
+        try:
+            M3UParser.save_file(self.current_file_path, self.entries)
+            self.set_modified(False)
+            self.status_label.setText(f"Saved to {self.current_file_path}")
+            self.log_action(f"Quick saved file: {os.path.basename(self.current_file_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not save file: {str(e)}")
+
+    def open_group_manager(self):
+        """Opens the group management dialog."""
+        dlg = ManageGroupsDialog(self.entries, self)
+        if dlg.exec():
+            if dlg.groups_modified:
+                self.set_modified(True)
+                self.refresh_table(clear_cache=False)
+                self.update_group_combo()
+                self.log_action("Groups managed/updated")
+
     def load_m3u_from_url(self, url=None):
         if not url:
             url, ok = QInputDialog.getText(self, "Load M3U from URL", "Enter Playlist URL:")
@@ -1628,7 +1843,7 @@ class M3UEditorWindow(QMainWindow):
             self.model.entries = self.entries
             self.current_file_path = None # No local file path
             self.current_url = url
-            self.setWindowTitle(f"Open Source M3U Editor - URL Stream")
+            self.set_modified(False)
             self.refresh_table()
             self.update_group_combo()
             self.status_label.setText(f"Loaded {len(self.entries)} channels from URL")
@@ -1649,6 +1864,7 @@ class M3UEditorWindow(QMainWindow):
                 self.entries.extend(new_entries)
                 self.refresh_table()
                 self.update_group_combo()
+                self.set_modified(True)
                 self.status_label.setText(f"Merged {len(new_entries)} channels from {os.path.basename(file_name)}")
                 QMessageBox.information(self, "Success", f"Merged {len(new_entries)} channels.")
                 self.log_action(f"Merged {len(new_entries)} channels from {os.path.basename(file_name)}")
@@ -1837,17 +2053,17 @@ class M3UEditorWindow(QMainWindow):
         if entry.logo != old_logo:
             self.model.rebuild_logo_map()
             
-        # Update table display immediately (optional, but looks nice)
+        # Update table display immediately
         self.model.dataChanged.emit(self.model.index(row, 0), self.model.index(row, 2))
+        self.set_modified(True)
 
     def add_entry(self):
         self.save_undo_state()
         new_entry = M3UEntry(name="New Channel", url="http://", group="Uncategorized")
         self.entries.append(new_entry)
-        self.refresh_table()
-        # Select the new item
-        self.model.layoutChanged.emit()
-        self.log_action("Added new entry")
+        self.refresh_table(clear_cache=False)
+        self.set_modified(True)
+        self.log_action(f"Added new entry: {new_entry.name}")
         # Find the new item in the proxy model to select it
         source_index = self.model.index(len(self.entries) - 1, 0)
         proxy_index = self.proxy_model.mapFromSource(source_index)
@@ -1876,10 +2092,10 @@ class M3UEditorWindow(QMainWindow):
             self.model.rebuild_logo_map()
             self.model.endResetModel()
             self.clear_editor()
+            self.set_modified(True)
             self.log_action(f"Deleted {count} entries")
 
     def move_up(self):
-        self.save_undo_state()
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             return
@@ -1890,10 +2106,12 @@ class M3UEditorWindow(QMainWindow):
         row = source_index.row()
         
         if row > 0:
+            self.save_undo_state()
             # Swap in list
             self.entries[row], self.entries[row-1] = self.entries[row-1], self.entries[row]
             # Refresh and keep selection
-            self.model.layoutChanged.emit()
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
             # Re-select based on new source position
             new_source_index = self.model.index(row - 1, 0)
             new_proxy_index = self.proxy_model.mapFromSource(new_source_index)
@@ -1901,7 +2119,6 @@ class M3UEditorWindow(QMainWindow):
                 self.table.selectRow(new_proxy_index.row())
 
     def move_down(self):
-        self.save_undo_state()
         selected_rows = self.table.selectionModel().selectedRows()
         if not selected_rows:
             return
@@ -1911,9 +2128,11 @@ class M3UEditorWindow(QMainWindow):
         row = source_index.row()
         
         if row < len(self.entries) - 1:
+            self.save_undo_state()
             # Swap in list
             self.entries[row], self.entries[row+1] = self.entries[row+1], self.entries[row]
-            self.model.layoutChanged.emit()
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
             new_source_index = self.model.index(row + 1, 0)
             new_proxy_index = self.proxy_model.mapFromSource(new_source_index)
             if new_proxy_index.isValid():
@@ -1957,6 +2176,7 @@ class M3UEditorWindow(QMainWindow):
             
             self.refresh_table(clear_cache=False)
             self.update_group_combo()
+            self.set_modified(True)
             self.log_action(f"Bulk edited group for {len(rows)} items")
 
     def batch_edit_user_agent(self):
@@ -1978,6 +2198,7 @@ class M3UEditorWindow(QMainWindow):
                     self.entries[row].user_agent = new_ua
             
             self.refresh_table(clear_cache=False)
+            self.set_modified(True)
             self.log_action(f"Batch edited User-Agent for {len(rows)} items")
 
     def find_replace(self):
@@ -1990,17 +2211,30 @@ class M3UEditorWindow(QMainWindow):
             self.create_backup("find_replace")
             self.save_undo_state()
             count = 0
+            # Map UI field names to M3UEntry attributes
+            field_map = {
+                "Name": "name",
+                "Group": "group",
+                "URL": "url",
+                "Logo": "logo",
+                "Tvg-ID": "tvg_id",
+                "Tvg-Chno": "tvg_chno",
+                "User-Agent": "user_agent"
+            }
+            attr = field_map.get(field, "name")
+            
             for entry in self.entries:
-                val = getattr(entry, field.lower(), "")
+                val = getattr(entry, attr, "")
                 if not case_sens:
                     if find_text.lower() in val.lower():
-                        setattr(entry, field.lower(), re.sub(re.escape(find_text), replace_text, val, flags=re.IGNORECASE))
+                        setattr(entry, attr, re.sub(re.escape(find_text), replace_text, val, flags=re.IGNORECASE))
                         count += 1
                 elif find_text in val:
-                    setattr(entry, field.lower(), val.replace(find_text, replace_text))
+                    setattr(entry, attr, val.replace(find_text, replace_text))
                     count += 1
             
-            self.refresh_table()
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
             QMessageBox.information(self, "Result", f"Replaced {count} occurrences.")
             self.log_action(f"Find & Replace: {count} occurrences of '{find_text}'")
 
@@ -2033,6 +2267,7 @@ class M3UEditorWindow(QMainWindow):
                 current_num += 1
             
             self.refresh_table()
+            self.set_modified(True)
             QMessageBox.information(self, "Success", "Channel numbering applied.")
             self.log_action("Applied channel numbering")
 
