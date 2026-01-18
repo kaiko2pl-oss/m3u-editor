@@ -13,6 +13,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 
 ### 🛠️ Editing & Organization
 *   **Bulk Editing**: Batch edit Groups, User-Agents, or specific attributes for selected channels.
+*   **User-Agent Manager**: Centralized management of User-Agents; apply to groups, selection, or all channels.
 *   **Smart Grouping**: Regex-based auto-categorization (Sports, Movies, News, etc.) with resolution and country detection.
 *   **Channel Numbering**: Wizard to renumber channels, sort by group, and apply prefixes.
 *   **Find & Replace**: Advanced search with Regular Expression support.
@@ -20,10 +21,15 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Deduplication**:
     *   **Find Duplicates**: Identify and highlight or batch delete duplicate URLs.
     *   **Smart Dedupe**: Intelligent removal keeping the entry with the highest resolution or most metadata.
+    *   **Fuzzy Finder**: Detect duplicates based on name similarity (e.g., "BBC One" vs "BBC 1").
 *   **Logo Tools**:
     *   **Scraper**: Find missing logos via Google Images.
     *   **Wizard**: Match logos from a repository URL.
+    *   **Local Logos**: Browse and assign local image files to channels.
 *   **Country Flags**: Auto-detect country from channel names and append flags to group titles.
+*   **Language Tools**:
+    *   **Quick Translate**: Translate channel names to a target language.
+    *   **Language Manager**: Customize regex patterns for language detection.
 
 ### 📺 Playback & Preview
 *   **Stream Preview**: Live video preview with playback controls, aspect ratio, speed control, and audio/subtitle track selection.
@@ -34,6 +40,8 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
     *   **Chromecast/DLNA**: Cast streams to devices on your network.
     *   **Cast Manager**: Control volume, seek, stop, and manage a **Cast Queue** for continuous playback.
     *   **Remote Control**: Dockable widget and Status Bar Mini-Player for quick cast control.
+    *   **Mobile Casting**: Generate QR codes to play streams on mobile devices via WiFi.
+    *   **Sleep Timer**: Automatically stop casting after a set duration.
 *   **Network Scanner**: Discover local UPnP/DLNA media devices.
 
 ### 🛡️ Diagnostics & Security
@@ -49,15 +57,17 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **Transcode Wizard**: Convert streams to MP4, MKV, or TS formats using `ffmpeg`.
 *   **Scheduled Recording**: Record live streams for a set duration.
 *   **Network Speed Test**: Integrated download speed test.
+*   **Cloud Sync**: Save and load playlists from local cloud folders (Google Drive, Dropbox, OneDrive).
 *   **EPG Integration**: Load XMLTV EPGs (supports .gz/.xz), cache locally, and view program schedules.
 *   **Task Scheduler**: Automate backups, EPG updates, and playlist validation.
 *   **Plugin System**: Extend functionality with external Python scripts.
 
 ### 🎨 UI & Customization
 *   **Theme Editor**: Customize application colors and save themes.
-*   **Dark Mode**: Built-in dark theme for reduced eye strain.
+*   **Dark Mode**: Built-in dark theme with platform-specific font rendering.
 *   **Quick Access Toolbar**: Pin your favorite actions for easy access.
 *   **Global Search**: Filter playlist by Name, Group, URL, or EPG ID.
+*   **Language Column**: Display and filter channels by detected language.
 *   **Virtual List View**: Efficient handling of large playlists (10k+ channels).
 
 ## Demo
@@ -71,6 +81,8 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **FFmpeg/ffprobe**: Required for Resolution Checker, Diagnostics, Transcoding, and Recording.
 *   **pychromecast**: Required for Casting features.
 *   **VLC**: Optional, for external playback.
+*   **qrcode**: Required for Mobile Casting (QR Code generation).
+*   **deep-translator**: Required for Quick Translate feature.
 
 ## Installation
 
@@ -78,7 +90,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 2.  Install the required dependencies:
 
 ```bash
-pip install PyQt6 pychromecast
+pip install PyQt6 pychromecast qrcode[pil] deep-translator
 ```
 
 *Note: Depending on your OS, you might need additional codecs for the video preview to work with all stream types.*

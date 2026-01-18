@@ -40,6 +40,12 @@ try:
 except ImportError:
     HAS_QRCODE = False
 
+try:
+    from deep_translator import GoogleTranslator
+    HAS_TRANSLATOR = True
+except ImportError:
+    HAS_TRANSLATOR = False
+
 from dataclasses import dataclass
 
 # Suppress urllib3 SSL warnings on macOS/LibreSSL
@@ -666,7 +672,7 @@ class PlaylistModel(QAbstractTableModel):
     def __init__(self, entries=None, parent=None):
         super().__init__(parent)
         self.entries = entries or []
-        self.headers = ["Group", "Name", "URL", "Security"]
+        self.headers = ["Group", "Name", "URL", "Security", "Language"]
         self.validation_data = {}  # id(entry) -> (color, msg, is_valid)
         self.highlight_data = {}   # id(entry) -> color
         self.logo_cache = {}       # url -> QPixmap
@@ -679,7 +685,7 @@ class PlaylistModel(QAbstractTableModel):
         return len(self.entries)
 
     def columnCount(self, parent=None):
-        return 4
+        return 5
 
     def rebuild_logo_map(self):
         self.logo_map = {}
@@ -706,6 +712,14 @@ class PlaylistModel(QAbstractTableModel):
             if index.column() == 3:
                 audit = self.security_data.get(id(entry))
                 return audit["summary"] if audit else "Not Audited"
+            if index.column() == 4:
+                # Detect language dynamically
+                name_lower = entry.name.lower()
+                for lang, patterns in LANGUAGE_PATTERNS.items():
+                    for pattern in patterns:
+                        if re.search(r'\b' + pattern + r'\b', name_lower):
+                            return lang
+                return "Unknown"
             
         elif role == Qt.ItemDataRole.UserRole:
             return entry
@@ -809,6 +823,7 @@ class PlaylistProxyModel(QSortFilterProxyModel):
         self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.show_favorites_only = False
         self.filter_health = "All Health"
+        self.filter_language = "All Languages"
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
@@ -835,6 +850,17 @@ class PlaylistProxyModel(QSortFilterProxyModel):
             if self.filter_health == "Invalid" and is_valid is not False: return False
             if self.filter_health == "Untested" and is_valid is not None: return False
             
+        # Language Filter
+        if self.filter_language != "All Languages":
+            patterns = LANGUAGE_PATTERNS.get(self.filter_language, [])
+            name_lower = entry.name.lower()
+            match = False
+            for pattern in patterns:
+                if re.search(r'\b' + pattern + r'\b', name_lower):
+                    match = True
+                    break
+            if not match: return False
+
         # Text Filter (Global Search: Name, Group, URL, EPG ID)
         txt = self.filter_text.lower()
         if not txt:
@@ -1079,6 +1105,105 @@ class BulkEditDialog(QDialog):
             if check.isChecked():
                 updates[attr] = self.inputs[attr].text()
         return updates
+
+class UserAgentManagerDialog(QDialog):
+    def __init__(self, groups, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("User-Agent Manager")
+        self.resize(500, 450)
+        self.groups = groups
+        self.settings = settings
+        
+        layout = QVBoxLayout(self)
+        
+        # UA List
+        layout.addWidget(QLabel("Select User-Agent:"))
+        self.ua_list = QListWidget()
+        
+        # Load defaults + saved
+        self.default_uas = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+            "VLC/3.0.16 LibVLC/3.0.16",
+            "Kodi/19.1 (Linux; Android 9.0)",
+            "IPTVSmartersPro",
+            "TiviMate/4.0.0",
+            "GSE SMART IPTV",
+            "Perfect Player"
+        ]
+        saved_uas = self.settings.value("custom_user_agents", [], type=list)
+        if not isinstance(saved_uas, list): saved_uas = []
+        
+        all_uas = self.default_uas + saved_uas
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_uas = [x for x in all_uas if not (x in seen or seen.add(x))]
+        
+        self.ua_list.addItems(unique_uas)
+        layout.addWidget(self.ua_list)
+        
+        # Custom Entry
+        input_layout = QHBoxLayout()
+        self.custom_ua = QLineEdit()
+        self.custom_ua.setPlaceholderText("Enter custom User-Agent...")
+        btn_add = QPushButton("Add to List")
+        btn_add.clicked.connect(self.add_custom_ua)
+        btn_delete = QPushButton("Remove Selected")
+        btn_delete.clicked.connect(self.remove_ua)
+        
+        input_layout.addWidget(self.custom_ua)
+        input_layout.addWidget(btn_add)
+        input_layout.addWidget(btn_delete)
+        layout.addLayout(input_layout)
+        
+        self.ua_list.currentItemChanged.connect(self.on_selection_change)
+        
+        # Target selection
+        layout.addWidget(QLabel("Apply to:"))
+        self.target_combo = QComboBox()
+        self.target_combo.addItem("All Channels")
+        self.target_combo.addItem("Selected Channels (in main view)")
+        if groups:
+            self.target_combo.insertSeparator(2)
+            self.target_combo.addItems(sorted(groups))
+        layout.addWidget(self.target_combo)
+        
+        # Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        
+    def on_selection_change(self, current, prev):
+        if current:
+            self.custom_ua.setText(current.text())
+
+    def add_custom_ua(self):
+        text = self.custom_ua.text().strip()
+        if text:
+            # Check if exists
+            items = self.ua_list.findItems(text, Qt.MatchFlag.MatchExactly)
+            if not items:
+                self.ua_list.addItem(text)
+                self.save_custom_uas()
+            else:
+                self.ua_list.setCurrentItem(items[0])
+
+    def remove_ua(self):
+        row = self.ua_list.currentRow()
+        if row >= 0:
+            self.ua_list.takeItem(row)
+            self.save_custom_uas()
+
+    def save_custom_uas(self):
+        current_items = [self.ua_list.item(i).text() for i in range(self.ua_list.count())]
+        custom_only = [ua for ua in current_items if ua not in self.default_uas]
+        self.settings.setValue("custom_user_agents", custom_only)
+
+    def get_data(self):
+        ua = self.custom_ua.text().strip()
+        target = self.target_combo.currentText()
+        return ua, target
 
 class ChannelNumberingDialog(QDialog):
     def __init__(self, parent=None):
@@ -1475,6 +1600,77 @@ class NetworkScannerDialog(QDialog):
         item.setData(Qt.ItemDataRole.UserRole, location)
         self.list_widget.addItem(item)
 
+class FuzzyFinderSignals(QObject):
+    result = pyqtSignal(list) # list of tuples (entry1_idx, entry2_idx, ratio)
+    finished = pyqtSignal()
+
+class FuzzyFinderWorker(QRunnable):
+    """Worker to find fuzzy duplicates using SequenceMatcher."""
+    def __init__(self, entries, threshold=0.85):
+        super().__init__()
+        self.entries = entries
+        self.threshold = threshold
+        self.signals = FuzzyFinderSignals()
+
+    def run(self):
+        # Optimization: Sort by name to compare neighbors, reducing complexity from O(N^2)
+        # We store (name, original_index)
+        indexed_names = []
+        for i, entry in enumerate(self.entries):
+            indexed_names.append((entry.name.lower(), i))
+        
+        indexed_names.sort(key=lambda x: x[0])
+        
+        results = []
+        # Compare each item with the next few items
+        lookahead = 10 
+        
+        for i in range(len(indexed_names)):
+            name1, idx1 = indexed_names[i]
+            for j in range(i + 1, min(i + lookahead, len(indexed_names))):
+                name2, idx2 = indexed_names[j]
+                
+                # Quick check: if length difference is huge, skip
+                if abs(len(name1) - len(name2)) > 3:
+                    continue
+                    
+                ratio = difflib.SequenceMatcher(None, name1, name2).ratio()
+                if ratio >= self.threshold:
+                    results.append((idx1, idx2, ratio))
+                    
+        self.signals.result.emit(results)
+        self.signals.finished.emit()
+
+class FuzzyResultsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fuzzy Duplicates")
+        self.resize(600, 400)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Potential duplicates found (Name similarity):"))
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Channel A", "Channel B", "Similarity"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+        
+        self.lbl_info = QLabel("Note: Select rows in the main window to merge or delete.")
+        layout.addWidget(self.lbl_info)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def add_result(self, name1, name2, ratio):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(name1))
+        self.table.setItem(row, 1, QTableWidgetItem(name2))
+        self.table.setItem(row, 2, QTableWidgetItem(f"{ratio:.2%}"))
+
 class SnapshotGalleryDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1737,6 +1933,15 @@ class CastManagerDialog(QDialog):
         q_btn_layout.addStretch()
         layout.addLayout(q_btn_layout)
         
+        # Sleep Timer
+        sleep_layout = QHBoxLayout()
+        sleep_layout.addWidget(QLabel("Sleep Timer:"))
+        self.combo_sleep = QComboBox()
+        self.combo_sleep.addItems(["Off", "15 min", "30 min", "60 min", "120 min"])
+        self.combo_sleep.currentTextChanged.connect(self.set_sleep_timer)
+        sleep_layout.addWidget(self.combo_sleep)
+        layout.addLayout(sleep_layout)
+        
         btn_layout = QHBoxLayout()
         
         btn_restart = QPushButton("Restart Media")
@@ -1752,6 +1957,16 @@ class CastManagerDialog(QDialog):
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
+
+    def set_sleep_timer(self, text):
+        if not self.parent_window: return
+        
+        if text == "Off":
+            self.parent_window.set_cast_sleep_timer(0)
+        else:
+            minutes = int(text.split()[0])
+            self.parent_window.set_cast_sleep_timer(minutes)
+            QMessageBox.information(self, "Sleep Timer", f"Casting will stop in {minutes} minutes.")
 
     def set_volume(self, value):
         if self.parent_window and self.parent_window.active_cast:
@@ -2884,6 +3099,7 @@ class StatisticsDialog(QDialog):
         self.create_group_tab()
         self.create_resolution_tab()
         self.create_health_tab()
+        self.create_language_tab()
         self.create_latency_tab()
         
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -2966,6 +3182,22 @@ class StatisticsDialog(QDialog):
                 counts["Untested"] += 1
                 
         self.tabs.addTab(self.create_tab_content(counts, ["Status", "Count", "Distribution"]), "Health")
+
+    def create_language_tab(self):
+        counts = {}
+        for entry in self.entries:
+            name_lower = entry.name.lower()
+            found_lang = "Unknown"
+            for lang, patterns in LANGUAGE_PATTERNS.items():
+                for pattern in patterns:
+                    if re.search(r'\b' + pattern + r'\b', name_lower):
+                        found_lang = lang
+                        break
+                if found_lang != "Unknown":
+                    break
+            counts[found_lang] = counts.get(found_lang, 0) + 1
+        
+        self.tabs.addTab(self.create_tab_content(counts, ["Language", "Count", "Distribution"]), "Language")
 
     def create_latency_tab(self):
         # Parse latencies from names (format: "Name [123ms]")
@@ -3763,6 +3995,166 @@ class CustomizeToolbarDialog(QDialog):
                 selected.append(item.data(Qt.ItemDataRole.UserRole))
         return selected
 
+class TranslateSignals(QObject):
+    result = pyqtSignal(int, str) # row, new_name
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+class TranslateWorker(QRunnable):
+    def __init__(self, items, target_lang):
+        super().__init__()
+        self.items = items # list of (row, name)
+        self.target_lang = target_lang
+        self.signals = TranslateSignals()
+        self.is_running = True
+
+    def run(self):
+        try:
+            translator = GoogleTranslator(source='auto', target=self.target_lang)
+            for row, name in self.items:
+                if not self.is_running: break
+                try:
+                    # Simple heuristic: don't translate short acronyms or numbers
+                    if len(name) < 3 or name.isdigit():
+                        continue
+                        
+                    translated = translator.translate(name)
+                    if translated and translated != name:
+                        self.signals.result.emit(row, translated)
+                except Exception as e:
+                    logging.error(f"Translation error for {name}: {e}")
+                
+                # Rate limiting
+                time.sleep(0.2)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
+            
+    def stop(self):
+        self.is_running = False
+
+class TranslateDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Quick Translate")
+        self.resize(300, 150)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Target Language:"))
+        self.combo = QComboBox()
+        # Common languages
+        langs = ["en", "es", "fr", "de", "it", "pt", "ru", "ar", "hi", "zh-CN", "ja", "ko", "tr", "nl", "pl"]
+        lang_names = ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Arabic", "Hindi", "Chinese (Simp)", "Japanese", "Korean", "Turkish", "Dutch", "Polish"]
+        
+        for code, name in zip(langs, lang_names):
+            self.combo.addItem(f"{name} ({code})", code)
+            
+        layout.addWidget(self.combo)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_data(self):
+        return self.combo.currentData()
+
+class LanguageManagerDialog(QDialog):
+    def __init__(self, current_patterns, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Language Manager")
+        self.resize(600, 500)
+        self.patterns = copy.deepcopy(current_patterns)
+        
+        layout = QVBoxLayout(self)
+        
+        # List of languages
+        self.list_widget = QListWidget()
+        self.list_widget.itemClicked.connect(self.load_patterns)
+        layout.addWidget(QLabel("Languages:"))
+        layout.addWidget(self.list_widget)
+        
+        # Edit area
+        self.edit_group = QGroupBox("Edit Patterns")
+        edit_layout = QVBoxLayout(self.edit_group)
+        
+        self.input_lang = QLineEdit()
+        self.input_lang.setPlaceholderText("Language Name")
+        edit_layout.addWidget(QLabel("Language:"))
+        edit_layout.addWidget(self.input_lang)
+        
+        self.input_patterns = QTextEdit()
+        self.input_patterns.setPlaceholderText("Enter regex patterns, one per line...")
+        edit_layout.addWidget(QLabel("Patterns (Regex, one per line):"))
+        edit_layout.addWidget(self.input_patterns)
+        
+        btn_save_lang = QPushButton("Save/Update Language")
+        btn_save_lang.clicked.connect(self.save_current_lang)
+        edit_layout.addWidget(btn_save_lang)
+        
+        layout.addWidget(self.edit_group)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_add = QPushButton("New Language")
+        btn_add.clicked.connect(self.new_language)
+        btn_del = QPushButton("Delete Language")
+        btn_del.clicked.connect(self.delete_language)
+        
+        btn_layout.addWidget(btn_add)
+        btn_layout.addWidget(btn_del)
+        layout.addLayout(btn_layout)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+        
+        self.refresh_list()
+        
+    def refresh_list(self):
+        self.list_widget.clear()
+        for lang in sorted(self.patterns.keys()):
+            self.list_widget.addItem(lang)
+            
+    def load_patterns(self, item):
+        lang = item.text()
+        self.input_lang.setText(lang)
+        patterns = self.patterns.get(lang, [])
+        self.input_patterns.setPlainText("\n".join(patterns))
+        
+    def new_language(self):
+        self.input_lang.clear()
+        self.input_patterns.clear()
+        self.input_lang.setFocus()
+        
+    def save_current_lang(self):
+        lang = self.input_lang.text().strip()
+        if not lang:
+            QMessageBox.warning(self, "Error", "Language name cannot be empty.")
+            return
+            
+        text = self.input_patterns.toPlainText()
+        patterns = [p.strip() for p in text.splitlines() if p.strip()]
+        
+        self.patterns[lang] = patterns
+        self.refresh_list()
+        QMessageBox.information(self, "Success", f"Saved patterns for {lang}.")
+        
+    def delete_language(self):
+        item = self.list_widget.currentItem()
+        if not item: return
+        
+        lang = item.text()
+        if QMessageBox.question(self, "Confirm", f"Delete {lang}?") == QMessageBox.StandardButton.Yes:
+            del self.patterns[lang]
+            self.refresh_list()
+            self.new_language()
+
+    def get_patterns(self):
+        return self.patterns
+
 class PluginManager:
     def __init__(self, plugin_dir="plugins"):
         self.plugin_dir = os.path.join(os.getcwd(), plugin_dir)
@@ -3814,6 +4206,41 @@ DEFAULT_THEME = {
     'highlight': '#89b4fa',
     'button_pressed': '#585b70',
     'input': '#181825'
+}
+
+# Language keywords for detection
+LANGUAGE_PATTERNS = {
+    "English": [r"english", r"eng", r"en", r"uk", r"us", r"usa"],
+    "Spanish": [r"spanish", r"esp", r"es", r"latino", r"mx"],
+    "French": [r"french", r"fra", r"fr"],
+    "German": [r"german", r"deu", r"de"],
+    "Italian": [r"italian", r"ita", r"it"],
+    "Portuguese": [r"portuguese", r"por", r"pt", r"br"],
+    "Hindi": [r"hindi", r"hin", r"ind"],
+    "Arabic": [r"arabic", r"ara", r"ar"],
+    "Russian": [r"russian", r"rus", r"ru"],
+    "Turkish": [r"turkish", r"tur", r"tr"],
+    "Chinese": [r"chinese", r"chn", r"cn"],
+    "Japanese": [r"japanese", r"jpn", r"jp"],
+    "Korean": [r"korean", r"kor", r"kr"],
+    "Tamil": [r"tamil"],
+    "Telugu": [r"telugu"],
+    "Malayalam": [r"malayalam"],
+    "Kannada": [r"kannada"],
+    "Punjabi": [r"punjabi"],
+    "Bengali": [r"bengali"],
+    "Marathi": [r"marathi"],
+    "Urdu": [r"urdu"],
+    "Thai": [r"thai"],
+    "Vietnamese": [r"vietnamese"],
+    "Indonesian": [r"indonesian"],
+    "Polish": [r"polish", r"pl"],
+    "Dutch": [r"dutch", r"nl"],
+    "Greek": [r"greek", r"gr"],
+    "Swedish": [r"swedish", r"se"],
+    "Danish": [r"danish", r"dk"],
+    "Norwegian": [r"norwegian", r"no"],
+    "Finnish": [r"finnish", r"fi"],
 }
 
 # Determine font based on platform to avoid Qt warnings
@@ -3995,6 +4422,9 @@ class M3UEditorWindow(QMainWindow):
         # Apply initial theme (uses current_theme)
         self.toggle_theme(initial=True)
         
+        # Load custom languages
+        self.load_language_patterns()
+        
         # Performance Utils
         self.logo_loader = ThrottledLogoLoader(self.thread_pool)
         self.logo_loader.signals.result.connect(self.on_logo_loaded)
@@ -4026,6 +4456,9 @@ class M3UEditorWindow(QMainWindow):
         self.cast_queue = []
         self.cast_poll_timer = QTimer()
         self.cast_poll_timer.timeout.connect(self.check_cast_status)
+        self.cast_sleep_timer = QTimer()
+        self.cast_sleep_timer.setSingleShot(True)
+        self.cast_sleep_timer.timeout.connect(self.stop_cast_session)
         self.monitor_dialog = None
         
         # Scheduler
@@ -4038,6 +4471,12 @@ class M3UEditorWindow(QMainWindow):
              self.last_backup_time = QDateTime.currentDateTime()
         self.last_epg_run_date = self.settings.value("scheduler/last_epg_date", "")
         self.last_val_run_date = self.settings.value("scheduler/last_val_date", "")
+
+    def load_language_patterns(self):
+        saved = self.settings.value("language_patterns", {})
+        if saved:
+            LANGUAGE_PATTERNS.clear()
+            LANGUAGE_PATTERNS.update(saved)
 
     def init_ui(self):
         # Main Layout
@@ -4113,6 +4552,17 @@ class M3UEditorWindow(QMainWindow):
         self.health_combo.addItems(["All Health", "Valid", "Invalid", "Untested"])
         self.health_combo.currentTextChanged.connect(self.filter_table)
         
+        self.language_combo = QComboBox()
+        self.language_combo.setFixedWidth(120)
+        self.language_combo.addItem("All Languages")
+        self.language_combo.addItems(sorted(LANGUAGE_PATTERNS.keys()))
+        self.language_combo.currentTextChanged.connect(self.filter_table)
+
+        self.btn_reset_filters = QPushButton("Reset Filters")
+        self.btn_reset_filters.setToolTip("Clear all active filters")
+        self.btn_reset_filters.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+        self.btn_reset_filters.clicked.connect(self.reset_filters)
+
         # toolbar.addWidget(btn_add) # Already added above
         toolbar.addWidget(btn_delete)
         toolbar.addWidget(self.btn_validate)
@@ -4138,7 +4588,9 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self.group_combo)
         toolbar.addWidget(self.health_combo)
+        toolbar.addWidget(self.language_combo)
         toolbar.addWidget(self.search_bar)
+        toolbar.addWidget(self.btn_reset_filters)
         
         main_layout.addLayout(toolbar)
 
@@ -4449,9 +4901,25 @@ class M3UEditorWindow(QMainWindow):
         name_dup_action.triggered.connect(self.find_name_duplicates)
         tools_menu.addAction(name_dup_action)
         
+        fuzzy_dup_action = QAction("Fuzzy Duplicate Finder...", self)
+        fuzzy_dup_action.triggered.connect(self.find_fuzzy_duplicates)
+        tools_menu.addAction(fuzzy_dup_action)
+        
         fav_mgr_action = QAction("Favorites Manager...", self)
         fav_mgr_action.triggered.connect(self.open_favorites_manager)
         tools_menu.addAction(fav_mgr_action)
+        
+        ua_mgr_action = QAction("User-Agent Manager...", self)
+        ua_mgr_action.triggered.connect(self.open_user_agent_manager)
+        tools_menu.addAction(ua_mgr_action)
+        
+        lang_mgr_action = QAction("Language Manager...", self)
+        lang_mgr_action.triggered.connect(self.open_language_manager)
+        tools_menu.addAction(lang_mgr_action)
+        
+        trans_action = QAction("Quick Translate...", self)
+        trans_action.triggered.connect(self.open_quick_translate)
+        tools_menu.addAction(trans_action)
         
         smart_dedupe_action = QAction("Smart Dedupe...", self)
         smart_dedupe_action.triggered.connect(self.smart_dedupe)
@@ -5471,7 +5939,15 @@ class M3UEditorWindow(QMainWindow):
         self.proxy_model.filter_text = self.search_bar.text()
         self.proxy_model.filter_group = self.group_combo.currentText()
         self.proxy_model.filter_health = self.health_combo.currentText()
+        self.proxy_model.filter_language = self.language_combo.currentText()
         self.proxy_model.invalidateFilter()
+
+    def reset_filters(self):
+        self.search_bar.clear()
+        self.group_combo.setCurrentIndex(0) # All Groups
+        self.health_combo.setCurrentIndex(0) # All Health
+        self.language_combo.setCurrentIndex(0) # All Languages
+        # filter_table is called automatically via signals
 
     def bulk_edit_group(self):
         selected_indices = self.get_selected_rows()
@@ -5994,6 +6470,7 @@ class M3UEditorWindow(QMainWindow):
                 found_category = None
                 found_res = ""
                 found_country = ""
+                found_language = ""
 
                 # 1. Detect Category
                 for category, patterns in categories.items():
@@ -6020,11 +6497,28 @@ class M3UEditorWindow(QMainWindow):
                         found_country = flag
                         break
 
-                # 4. Apply Grouping
+                # 4. Detect Language
+                for lang, patterns in LANGUAGE_PATTERNS.items():
+                    for pattern in patterns:
+                        if re.search(r'\b' + pattern + r'\b', name_lower):
+                            found_language = lang
+                            break
+                    if found_language:
+                        break
+
+                # 5. Apply Grouping
                 if found_category:
                     new_group = found_category
+                    
+                    prefix_parts = []
                     if found_country:
-                        new_group = f"{found_country} {new_group}"
+                        prefix_parts.append(found_country)
+                    if found_language:
+                        prefix_parts.append(found_language)
+                    
+                    if prefix_parts:
+                        new_group = f"{' '.join(prefix_parts)} {new_group}"
+                        
                     if found_res:
                         new_group = f"{new_group} [{found_res}]"
                     
@@ -6372,6 +6866,38 @@ class M3UEditorWindow(QMainWindow):
             
             self.table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
             self.model.layoutChanged.emit() # Refresh highlights
+
+    def find_fuzzy_duplicates(self):
+        if not self.entries:
+            QMessageBox.warning(self, "Warning", "No entries to search.")
+            return
+            
+        self.status_label.setText("Searching for fuzzy duplicates...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        worker = FuzzyFinderWorker(self.entries)
+        worker.signals.result.connect(self.on_fuzzy_results)
+        worker.signals.finished.connect(lambda: self.progress_bar.setVisible(False))
+        worker.signals.finished.connect(lambda: self.status_label.setText("Fuzzy search complete."))
+        self.thread_pool.start(worker)
+
+    def on_fuzzy_results(self, results):
+        if not results:
+            QMessageBox.information(self, "Fuzzy Finder", "No fuzzy duplicates found.")
+            return
+            
+        dlg = FuzzyResultsDialog(self)
+        for idx1, idx2, ratio in results:
+            name1 = self.entries[idx1].name
+            name2 = self.entries[idx2].name
+            dlg.add_result(name1, name2, ratio)
+            # Highlight in model
+            self.model.highlight_data[id(self.entries[idx1])] = QColor("#ffe0b2") # Light Orange
+            self.model.highlight_data[id(self.entries[idx2])] = QColor("#ffe0b2")
+        
+        self.model.layoutChanged.emit()
+        dlg.exec()
 
     def smart_dedupe(self):
         if not self.entries:
@@ -6911,6 +7437,14 @@ class M3UEditorWindow(QMainWindow):
         if self.active_cast:
             self.active_cast.set_volume(value / 100.0)
 
+    def set_cast_sleep_timer(self, minutes):
+        if minutes > 0:
+            self.cast_sleep_timer.start(minutes * 60 * 1000)
+            self.log_action(f"Cast sleep timer set for {minutes} minutes")
+        else:
+            self.cast_sleep_timer.stop()
+            self.log_action("Cast sleep timer disabled")
+
     def open_stream_diagnostics(self):
         selected_rows = self.get_selected_rows()
         if not selected_rows:
@@ -6975,6 +7509,84 @@ class M3UEditorWindow(QMainWindow):
 
         self.monitor_dialog = LiveStreamMonitorDialog(entries_to_monitor, self)
         self.monitor_dialog.show()
+
+    def open_user_agent_manager(self):
+        groups = list(set(e.group for e in self.entries if e.group))
+        dlg = UserAgentManagerDialog(groups, self.settings, self)
+        if dlg.exec():
+            ua, target = dlg.get_data()
+            if not ua:
+                return
+                
+            self.create_backup("ua_manager")
+            self.save_undo_state()
+            count = 0
+            
+            entries_to_update = []
+            if target == "All Channels":
+                entries_to_update = self.entries
+            elif target == "Selected Channels (in main view)":
+                selected_rows = self.get_selected_rows()
+                # Map proxy to source
+                for idx in selected_rows:
+                    source_index = self.proxy_model.mapToSource(idx)
+                    entries_to_update.append(self.entries[source_index.row()])
+            else:
+                # Group
+                entries_to_update = [e for e in self.entries if e.group == target]
+                
+            for entry in entries_to_update:
+                entry.user_agent = ua
+                count += 1
+                
+            self.refresh_table(clear_cache=False)
+            self.set_modified(True)
+            QMessageBox.information(self, "Success", f"Updated User-Agent for {count} channels.")
+            self.log_action(f"Applied User-Agent to {count} channels ({target})")
+
+    def open_language_manager(self):
+        dlg = LanguageManagerDialog(LANGUAGE_PATTERNS, self)
+        if dlg.exec():
+            new_patterns = dlg.get_patterns()
+            LANGUAGE_PATTERNS.clear()
+            LANGUAGE_PATTERNS.update(new_patterns)
+            self.settings.setValue("language_patterns", new_patterns)
+            
+            # Refresh UI elements that use languages
+            self.language_combo.clear()
+            self.language_combo.addItem("All Languages")
+            self.language_combo.addItems(sorted(LANGUAGE_PATTERNS.keys()))
+            
+            QMessageBox.information(self, "Success", "Language patterns updated.")
+
+    def open_quick_translate(self):
+        if not HAS_TRANSLATOR:
+            QMessageBox.warning(self, "Missing Library", "Please install 'deep-translator' to use this feature.\n\npip install deep-translator")
+            return
+            
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select channels to translate.")
+            return
+            
+        dlg = TranslateDialog(self)
+        if dlg.exec():
+            target_lang = dlg.get_data()
+            items = []
+            for idx in selected_rows:
+                source_index = self.proxy_model.mapToSource(idx)
+                row = source_index.row()
+                items.append((row, self.entries[row].name))
+            
+            self.status_label.setText(f"Translating {len(items)} channels...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            
+            worker = TranslateWorker(items, target_lang)
+            worker.signals.result.connect(lambda r, n: self.model.setData(self.model.index(r, 1), n))
+            worker.signals.finished.connect(lambda: self.status_label.setText("Translation complete."))
+            worker.signals.finished.connect(lambda: self.progress_bar.setVisible(False))
+            self.thread_pool.start(worker)
 
     def open_task_scheduler(self):
         dlg = TaskSchedulerDialog(self.settings, self)

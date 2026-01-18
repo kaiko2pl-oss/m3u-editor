@@ -56,6 +56,8 @@ The application relies heavily on `QThreadPool` and `QRunnable` to keep the UI r
 | `FFmpegWorker` | Runs FFmpeg commands for transcoding/recording. | `output(str)`, `finished()`, `error(str)` |
 | `DiagnosticsWorker` | Runs ffprobe for stream analysis. | `result(dict)`, `error(str)` |
 | `LogoWizardWorker` | Matches logos from a repository. | `found(row, url)`, `finished(count)` |
+| `FuzzyFinderWorker` | Finds duplicates using sequence matching (Levenshtein distance). | `result(list)`, `finished()` |
+| `TranslateWorker` | Translates channel names using `deep_translator`. | `result(row, name)`, `finished()`, `error(str)` |
 
 **Note on Thread Safety**: Workers emit signals to communicate with the main thread. Direct modification of the `entries` list or UI widgets from workers is avoided.
 
@@ -64,6 +66,8 @@ The application relies heavily on `QThreadPool` and `QRunnable` to keep the UI r
 ### Python Packages
 *   `PyQt6`: Core GUI framework.
 *   `requests`: (Implicitly replaced by `urllib` in current code to reduce deps, but standard for this type of app).
+*   `pychromecast`: For casting support.
+*   `deep_translator`: For channel name translation.
 
 ### System Binaries
 *   **VLC**: Required for the "Open in VLC" feature. The app attempts to auto-detect the path or uses the user-configured path in Settings.
@@ -90,6 +94,9 @@ The application relies heavily on `QThreadPool` and `QRunnable` to keep the UI r
 
 ### 5.5 Task Scheduler
 *   **Implementation**: Uses `QTimer` in the main window to check for scheduled tasks (Backup, EPG, Validation) every minute against `QSettings`.
+
+### 5.6 Cloud Sync
+*   **Implementation**: Abstraction over local file system paths that map to cloud storage services (Google Drive, Dropbox, OneDrive).
 
 ## 6. Known Issues & Future Work
 
