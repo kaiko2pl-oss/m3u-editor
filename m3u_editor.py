@@ -22,6 +22,7 @@ import hashlib
 import socket
 import shutil
 import random
+import json
 
 try:
     import pychromecast
@@ -39,7 +40,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QHeaderView, QSplitter, QGroupBox, QFormLayout, QColorDialog,
     QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect, QDateTimeEdit,
     QMenu, QComboBox, QDialog, QDialogButtonBox, QCheckBox, QTabWidget,
-    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem, QDockWidget, QRadioButton, QScrollArea, QGridLayout,
+    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem, QDockWidget, QRadioButton, QScrollArea, QGridLayout, QTreeWidget, QTreeWidgetItem, QToolBar,
     QSlider, QStyle, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
@@ -812,9 +813,14 @@ class PlaylistProxyModel(QSortFilterProxyModel):
             if self.filter_health == "Invalid" and is_valid is not False: return False
             if self.filter_health == "Untested" and is_valid is not None: return False
             
-        # Text Filter (Name OR Group)
+        # Text Filter (Global Search: Name, Group, URL, EPG ID)
         txt = self.filter_text.lower()
-        text_match = txt in entry.name.lower() or txt in entry.group.lower()
+        if not txt:
+            text_match = True
+        else:
+            text_match = (txt in entry.name.lower() or txt in entry.group.lower() or 
+                          txt in entry.url.lower() or txt in entry.tvg_id.lower())
+
         group_match = (self.filter_group == "All Groups" or entry.group == self.filter_group)
         
         return text_match and group_match
@@ -2841,6 +2847,108 @@ class FFmpegWorker(QRunnable):
         except Exception as e:
             self.signals.error.emit(str(e))
 
+class DiagnosticsSignals(QObject):
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+class DiagnosticsWorker(QRunnable):
+    """Worker to run ffprobe and get stream details."""
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.signals = DiagnosticsSignals()
+
+    def run(self):
+        try:
+            # Run ffprobe to get JSON output
+            cmd = [
+                "ffprobe", "-v", "quiet", 
+                "-print_format", "json", 
+                "-show_format", "-show_streams", 
+                self.url
+            ]
+            
+            # Set creationflags for Windows to hide console window
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=15, 
+                encoding='utf-8', 
+                errors='ignore',
+                creationflags=creationflags
+            )
+            
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout)
+                    self.signals.result.emit(data)
+                except json.JSONDecodeError:
+                    self.signals.error.emit("Failed to parse ffprobe output.")
+            else:
+                self.signals.error.emit(f"ffprobe error: {result.stderr}")
+                
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
+
+class StreamDiagnosticsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stream Diagnostics")
+        self.resize(600, 500)
+        layout = QVBoxLayout(self)
+        
+        self.status_lbl = QLabel("Analyzing stream...")
+        self.status_lbl.setStyleSheet("font-weight: bold; color: #89b4fa;")
+        layout.addWidget(self.status_lbl)
+        
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Property", "Value"])
+        self.tree.setColumnWidth(0, 200)
+        layout.addWidget(self.tree)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def populate_data(self, data):
+        self.status_lbl.setText("Analysis Complete")
+        self.tree.clear()
+        
+        # Format Info
+        fmt = data.get("format", {})
+        fmt_item = QTreeWidgetItem(self.tree, ["Format Container"])
+        fmt_item.setExpanded(True)
+        for k, v in fmt.items():
+            if k != "tags":
+                QTreeWidgetItem(fmt_item, [k, str(v)])
+        
+        # Streams Info
+        streams = data.get("streams", [])
+        for i, stream in enumerate(streams):
+            codec_type = stream.get("codec_type", "unknown").upper()
+            s_item = QTreeWidgetItem(self.tree, [f"Stream #{i} ({codec_type})"])
+            s_item.setExpanded(True)
+            
+            # Prioritize important fields
+            priority_fields = ["codec_name", "width", "height", "r_frame_rate", "bit_rate", "sample_rate", "channels"]
+            for field in priority_fields:
+                if field in stream:
+                    QTreeWidgetItem(s_item, [field, str(stream[field])])
+            
+            # Add rest
+            for k, v in stream.items():
+                if k not in priority_fields and k != "tags" and k != "disposition":
+                    QTreeWidgetItem(s_item, [k, str(v)])
+
+    def show_error(self, err):
+        self.status_lbl.setText(f"Error: {err}")
+
 class TranscodeDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2922,6 +3030,41 @@ class ScheduledRecordingDialog(QDialog):
             
     def get_settings(self):
         return self.start_time.dateTime(), self.duration.value(), self.output_file
+
+class CustomizeToolbarDialog(QDialog):
+    def __init__(self, available_actions, current_actions, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Customize Quick Access")
+        self.resize(300, 400)
+        self.available = available_actions
+        self.current = current_actions
+        
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select actions to show on toolbar:"))
+        
+        self.list_widget = QListWidget()
+        
+        # Populate list
+        for action_id, info in self.available.items():
+            item = QListWidgetItem(info["label"])
+            item.setData(Qt.ItemDataRole.UserRole, action_id)
+            item.setCheckState(Qt.CheckState.Checked if action_id in self.current else Qt.CheckState.Unchecked)
+            self.list_widget.addItem(item)
+            
+        layout.addWidget(self.list_widget)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_selected_actions(self):
+        selected = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(item.data(Qt.ItemDataRole.UserRole))
+        return selected
 
 # -----------------------------------------------------------------------------
 # GUI Implementation
@@ -3113,6 +3256,20 @@ class M3UEditorWindow(QMainWindow):
         self.logo_loader = ThrottledLogoLoader(self.thread_pool)
         self.logo_loader.signals.result.connect(self.on_logo_loaded)
         
+        # Define available actions for Quick Access
+        self.qa_actions_map = {
+            "save": {"label": "Save", "icon": QStyle.StandardPixmap.SP_DialogSaveButton, "slot": self.quick_save, "tooltip": "Save Playlist"},
+            "load": {"label": "Load", "icon": QStyle.StandardPixmap.SP_DialogOpenButton, "slot": self.load_m3u, "tooltip": "Load Playlist"},
+            "validate": {"label": "Health", "icon": QStyle.StandardPixmap.SP_DialogApplyButton, "slot": self.validate_streams, "tooltip": "Check Stream Health"},
+            "cast": {"label": "Cast", "icon": QStyle.StandardPixmap.SP_ComputerIcon, "slot": self.cast_selected_stream, "tooltip": "Cast Selected Stream"},
+            "audit": {"label": "Audit", "icon": QStyle.StandardPixmap.SP_MessageBoxWarning, "slot": self.audit_streams, "tooltip": "Security Audit"},
+            "diagnostics": {"label": "Diagnose", "icon": QStyle.StandardPixmap.SP_MessageBoxInformation, "slot": self.open_stream_diagnostics, "tooltip": "Stream Diagnostics"},
+            "epg": {"label": "EPG", "icon": QStyle.StandardPixmap.SP_FileDialogDetailedView, "slot": self.prompt_epg_url, "tooltip": "Load EPG"},
+            "settings": {"label": "Settings", "icon": QStyle.StandardPixmap.SP_FileDialogListView, "slot": self.open_settings, "tooltip": "Settings"},
+            "theme": {"label": "Theme", "icon": QStyle.StandardPixmap.SP_DesktopIcon, "slot": lambda: self.toggle_theme(False), "tooltip": "Toggle Dark Mode"},
+            "iptv": {"label": "Player", "icon": QStyle.StandardPixmap.SP_MediaPlay, "slot": self.open_iptv_player, "tooltip": "IPTV Player Mode"}
+        }
+        
         self.init_ui()
         self.model.logo_loader = self.logo_loader
         self.iptv_window = None
@@ -3132,6 +3289,9 @@ class M3UEditorWindow(QMainWindow):
         
         # --- Menu Bar ---
         self.create_menus()
+
+        # --- Quick Access Toolbar ---
+        self.create_quick_access_toolbar()
 
         # --- Toolbar ---
         toolbar = QHBoxLayout()
@@ -3176,7 +3336,7 @@ class M3UEditorWindow(QMainWindow):
         
         # Search & Filter
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search channels...")
+        self.search_bar.setPlaceholderText("Global Search (Name, URL, Group, ID)...")
         self.search_bar.setFixedWidth(200)
         self.search_bar.textChanged.connect(self.filter_table)
         
@@ -3562,6 +3722,10 @@ class M3UEditorWindow(QMainWindow):
         transcode_action.triggered.connect(self.open_transcode_wizard)
         tools_menu.addAction(transcode_action)
         
+        diag_action = QAction("Stream Diagnostics...", self)
+        diag_action.triggered.connect(self.open_stream_diagnostics)
+        tools_menu.addAction(diag_action)
+        
         record_action = QAction("Schedule Recording...", self)
         record_action.triggered.connect(self.open_scheduled_recording)
         tools_menu.addAction(record_action)
@@ -3605,6 +3769,34 @@ class M3UEditorWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Actions
     # -------------------------------------------------------------------------
+
+    def create_quick_access_toolbar(self):
+        self.qa_toolbar = QToolBar("Quick Access")
+        self.qa_toolbar.setMovable(False)
+        self.qa_toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.qa_toolbar.customContextMenuRequested.connect(self.open_toolbar_customizer)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.qa_toolbar)
+        
+        # Load saved actions or default
+        saved_actions = self.settings.value("quick_access_actions", ["save", "validate", "cast", "diagnostics"])
+        # Ensure saved actions are valid lists (handle potential QVariant/type issues)
+        if not isinstance(saved_actions, list):
+            saved_actions = ["save", "validate", "cast", "diagnostics"]
+            
+        self.update_quick_access_toolbar(saved_actions)
+
+    def update_quick_access_toolbar(self, action_ids):
+        self.qa_toolbar.clear()
+        for aid in action_ids:
+            if aid in self.qa_actions_map:
+                info = self.qa_actions_map[aid]
+                action = QAction(self.style().standardIcon(info["icon"]), info["label"], self)
+                action.setToolTip(info["tooltip"])
+                action.triggered.connect(info["slot"])
+                self.qa_toolbar.addAction(action)
+        
+        # Add spacer/separator logic if needed, or a customize button at the end
+        # self.qa_toolbar.addAction("Customize...", self.open_toolbar_customizer)
 
     def log_action(self, message):
         """Logs an action to the history tab."""
@@ -5744,6 +5936,46 @@ class M3UEditorWindow(QMainWindow):
     def set_cast_volume(self, value):
         if self.active_cast:
             self.active_cast.set_volume(value / 100.0)
+
+    def open_stream_diagnostics(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select a stream to analyze.")
+            return
+            
+        # Use first selected
+        idx = self.proxy_model.mapToSource(selected_rows[0])
+        entry = self.entries[idx.row()]
+        
+        dlg = StreamDiagnosticsDialog(self)
+        dlg.show() # Non-blocking to allow worker to run
+        
+        worker = DiagnosticsWorker(entry.url)
+        worker.signals.result.connect(dlg.populate_data)
+        worker.signals.error.connect(dlg.show_error)
+        self.thread_pool.start(worker)
+
+    def open_toolbar_customizer(self):
+        current = self.settings.value("quick_access_actions", ["save", "validate", "cast", "diagnostics"])
+        if not isinstance(current, list): current = ["save", "validate", "cast", "diagnostics"]
+        
+        dlg = CustomizeToolbarDialog(self.qa_actions_map, current, self)
+        if dlg.exec():
+            new_actions = dlg.get_selected_actions()
+            self.settings.setValue("quick_access_actions", new_actions)
+            self.update_quick_access_toolbar(new_actions)
+
+    def cast_selected_stream(self):
+        """Wrapper to cast the currently selected stream from the table."""
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select a stream to cast.")
+            return
+            
+        idx = self.proxy_model.mapToSource(selected_rows[0])
+        entry = self.entries[idx.row()]
+        dlg = CastDialog(entry.url, self, stream_name=entry.name)
+        dlg.exec()
 
 # -----------------------------------------------------------------------------
 # Main Execution

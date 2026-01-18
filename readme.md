@@ -4,63 +4,68 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 
 ## Features
 
-*   **Playlist Management**: Load and save M3U playlists with support for standard `#EXTINF` metadata (Group, Logo, Name, Duration).
-*   **Load from URL**: Download and edit playlists directly from a web link with a dedicated **Reload** button for quick refreshes.
-*   **Performance Optimized**:
-    *   **Fast Parsing**: High-performance M3U parser for near-instant loading of large playlists.
-    *   **Virtual List View**: Efficient handling of large datasets using `QAbstractTableModel` and `QListView`.
-    *   **Efficient Undo/Redo**: Delta-based undo system reduces memory overhead.
-    *   **Throttled Logo Loading**: Background logo fetching with targeted UI updates for smooth scrolling.
-*   **Enhanced Stream Preview**:
-    *   **Live Playback**: Interactive video preview with full playback controls (Play/Pause, Stop, Volume, Fullscreen).
-    *   **Navigation**: Browse through channels directly within the preview window using Next/Previous buttons.
-    *   **Integrated Storyboard**: Generate and view frame-by-frame storyboards of your streams.
-    *   **Live Editing**: Edit the channel's group directly from the preview screen with real-time synchronization.
-    *   **Playback Control**: Adjust playback speed (0.5x - 2.0x) and aspect ratio (Fit, Stretch, Zoom).
-    *   **Track Selection**: Switch between available Audio and Subtitle tracks.
-    *   **Snapshot**: Capture high-quality screenshots of the current stream.
-    *   **Always on Top**: Toggle to keep the preview window above other applications.
-    *   **Quick Actions**: Copy stream URL to clipboard directly from the preview.
-*   **Stream Security Audit**:
-    *   **Comprehensive Scanning**: Audit streams for SSL/TLS validity, content-type correctness, and suspicious redirects.
-    *   **Reputation Check**: Identify streams from known malicious or low-reputation domains.
-    *   **Visual Indicators**: Color-coded security status (Green Shield for secure, Warning for insecure) with detailed tooltips.
-*   **Smart Organization**:
-    *   **Advanced Smart Grouping**: Regex-based categorization with resolution (4K, HD, SD) and country detection.
-    *   **Manage Groups**: Dedicated dialog to bulk rename, add, or delete groups across the entire playlist.
-    *   **Drag and Drop**: Reorder channels easily by dragging rows.
-    *   **Context Menu**: Quick "Edit Group" and "Open in VLC" actions.
-    *   **Country Flags**: Auto-detect country from channel names and append flags to group titles.
-*   **Health Check**: Validate stream URLs via asynchronous HTTP HEAD requests with granular feedback.
-*   **Recent Streams**: Quickly access previously previewed channels from the "Recent" tab.
-*   **Favorites System**: Pin channels to a dedicated view using the "Favorites" toggle.
-*   **Search & Filter**: Real-time search and group-based filtering.
-*   **Export**: Export playlists to CSV format.
-*   **Dark Mode**: Sleek, modern dark theme for reduced eye strain.
-*   **Advanced Tools**:
-    *   **Backup & Restore**: Automatic ZIP-based backups created before major operations; easy restore wizard.
-    *   **Channel Numbering Wizard**: Renumber channels or add prefixes based on group sorting.
-    *   **Resolution Checker**: Uses `ffprobe` to detect stream resolution (SD, HD, 4K).
-    *   **Latency Checker**: Measure Time-To-First-Byte (TTFB) for streams.
-    *   **Logo Scraper**: Attempt to find missing logos via Google Images search.
-    *   **Find Duplicates**: Identify and highlight duplicate stream URLs.
-    *   **Smart Dedupe**: Intelligent removal of duplicates based on resolution quality or metadata completeness.
-    *   **Xtream Codes Support**: Load playlists and EPG directly from Xtream Codes API credentials.
-    *   **IPTV Player Mode**: A dedicated, full-screen capable interface for a lean-back viewing experience.
-    *   **Picture-in-Picture**: Keep the IPTV player visible in a small floating window while multitasking.
+### 🚀 Playlist Management
+*   **Universal Loading**: Load M3U/M3U8 files, download from URLs, or login via **Xtream Codes API**.
+*   **Merge & Split**: Merge multiple playlists with strategies (Append, Replace, Deduplicate) or split a playlist into separate files by Group.
+*   **Export**: Save with custom encoding or export metadata to CSV.
+*   **History**: Robust Undo/Redo system and action logging.
+*   **Backup & Restore**: Automatic ZIP-based backups before major operations; easy restore wizard.
+
+### 🛠️ Editing & Organization
+*   **Bulk Editing**: Batch edit Groups, User-Agents, or specific attributes for selected channels.
+*   **Smart Grouping**: Regex-based auto-categorization (Sports, Movies, News, etc.) with resolution and country detection.
+*   **Channel Numbering**: Wizard to renumber channels, sort by group, and apply prefixes.
+*   **Find & Replace**: Advanced search with Regular Expression support.
+*   **Deduplication**:
+    *   **Find Duplicates**: Identify and highlight or batch delete duplicate URLs.
+    *   **Smart Dedupe**: Intelligent removal keeping the entry with the highest resolution or most metadata.
+*   **Logo Tools**:
+    *   **Scraper**: Find missing logos via Google Images.
+    *   **Wizard**: Match logos from a repository URL.
+*   **Country Flags**: Auto-detect country from channel names and append flags to group titles.
+
+### 📺 Playback & Preview
+*   **Stream Preview**: Live video preview with playback controls, aspect ratio, speed control, and audio/subtitle track selection.
+*   **IPTV Player Mode**: Dedicated full-screen interface with channel list, search, and **Picture-in-Picture (PiP)** support.
+*   **Storyboard**: Generate frame-by-frame visual storyboards of streams.
+*   **Casting**:
+    *   **Chromecast/DLNA**: Cast streams to devices on your network.
+    *   **Cast Manager**: Control volume, seek, stop, and manage a **Cast Queue** for continuous playback.
+    *   **Remote Control**: Dockable widget and Status Bar Mini-Player for quick cast control.
+*   **Network Scanner**: Discover local UPnP/DLNA media devices.
+
+### 🛡️ Diagnostics & Security
+*   **Health Check**: Validate streams via asynchronous HTTP HEAD/GET requests.
+*   **Security Audit**: Scan for SSL validity, suspicious content types, redirects, and reputation.
+*   **Stream Diagnostics**: Detailed technical analysis (Codec, Bitrate, Resolution) using `ffprobe`.
+*   **Resolution & Latency**: Detect stream resolution (SD, HD, 4K) and measure response time (TTFB).
+*   **Auto-Repair**: Attempt to fix broken streams (protocol swaps, redirect following).
+*   **Broken Link Reporter**: Generate text reports of invalid streams.
+
+### ⚙️ Advanced Tools
+*   **Transcode Wizard**: Convert streams to MP4, MKV, or TS formats using `ffmpeg`.
+*   **Scheduled Recording**: Record live streams for a set duration.
+*   **Network Speed Test**: Integrated download speed test.
+*   **EPG Integration**: Load XMLTV EPGs (supports .gz/.xz), cache locally, and view program schedules.
+
+### 🎨 UI & Customization
+*   **Theme Editor**: Customize application colors and save themes.
+*   **Dark Mode**: Built-in dark theme for reduced eye strain.
+*   **Quick Access Toolbar**: Pin your favorite actions for easy access.
+*   **Global Search**: Filter playlist by Name, Group, URL, or EPG ID.
+*   **Virtual List View**: Efficient handling of large playlists (10k+ channels).
 
 ## Demo
 
-<!-- ![M3U Editor Demo](m3u-editor-demo.gif) -->
 *Visual overview of the application features.*
 
 ## Prerequisites
 
 *   Python 3.x
 *   PyQt6
-*   VLC (Optional, for external playback)
-*   FFmpeg/ffprobe (Optional, for Resolution Checker)
-*   pychromecast (Optional, for Casting support)
+*   **FFmpeg/ffprobe**: Required for Resolution Checker, Diagnostics, Transcoding, and Recording.
+*   **pychromecast**: Required for Casting features.
+*   **VLC**: Optional, for external playback.
 
 ## Installation
 
@@ -68,8 +73,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 2.  Install the required dependencies:
 
 ```bash
-pip install PyQt6
-pip install pychromecast
+pip install PyQt6 pychromecast
 ```
 
 *Note: Depending on your OS, you might need additional codecs for the video preview to work with all stream types.*
