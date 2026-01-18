@@ -18,6 +18,16 @@ import gzip
 import lzma
 import difflib
 from datetime import datetime
+import hashlib
+import socket
+import shutil
+
+try:
+    import pychromecast
+    HAS_CHROMECAST = True
+except ImportError:
+    HAS_CHROMECAST = False
+
 from dataclasses import dataclass
 from typing import List, Optional, Iterable, Dict, Any
 from performance_utils import ThrottledLogoLoader, EfficientUndoStack, FastM3UParser
@@ -26,17 +36,17 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QLineEdit,
     QFileDialog, QMessageBox, QHeaderView, QSplitter, QGroupBox, QFormLayout,
-    QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect,
+    QInputDialog, QAbstractItemView, QProgressBar, QGraphicsOpacityEffect, QDateTimeEdit,
     QMenu, QComboBox, QDialog, QDialogButtonBox, QCheckBox, QTabWidget,
-    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem,
+    QListView, QStackedWidget, QSpinBox, QTextEdit, QTableWidget, QTableWidgetItem, QDockWidget, QRadioButton, QScrollArea, QGridLayout,
     QSlider, QStyle, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, 
                           QEasingCurve, QAbstractAnimation, QSettings, QAbstractTableModel,
                           QSortFilterProxyModel, QThreadPool, QRunnable, QObject, QByteArray, QSize, QTimer,
-                          QDateTime)
+                          QDateTime, QPoint)
 from PyQt6.QtGui import QColor, QPalette, QAction, QPixmap, QIcon, QImage, QStandardItemModel, QStandardItem
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QMediaMetaData
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 
 # -----------------------------------------------------------------------------
@@ -286,9 +296,11 @@ class EPGSignals(QObject):
 
 class EPGWorker(QRunnable):
     """Worker to fetch and parse XMLTV data (XML, GZ, XZ) from multiple sources."""
-    def __init__(self, urls):
+    def __init__(self, urls, cache_dir="epg_cache", cache_ttl=86400):
         super().__init__()
         self.urls = urls if isinstance(urls, list) else [urls]
+        self.cache_dir = os.path.join(os.getcwd(), cache_dir)
+        self.cache_ttl = cache_ttl
         self.signals = EPGSignals()
 
     def run(self):
@@ -297,16 +309,40 @@ class EPGWorker(QRunnable):
             "programs": {}  # id -> list of programs
         }
         
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
         try:
             total_urls = len(self.urls)
             for i, url in enumerate(self.urls):
                 if not url: continue
                 
-                self.signals.progress.emit(f"Fetching source {i+1}/{total_urls}...")
+                url_hash = hashlib.md5(url.encode()).hexdigest()
+                cache_file = os.path.join(self.cache_dir, url_hash)
+                raw_data = None
+                
+                # Check cache
+                if os.path.exists(cache_file):
+                    if time.time() - os.path.getmtime(cache_file) < self.cache_ttl:
+                        try:
+                            with open(cache_file, "rb") as f:
+                                raw_data = f.read()
+                            self.signals.progress.emit(f"Loaded cached source {i+1}/{total_urls}...")
+                        except Exception:
+                            pass
+
+                if not raw_data:
+                    self.signals.progress.emit(f"Fetching source {i+1}/{total_urls}...")
+                    try:
+                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=60) as response:
+                            raw_data = response.read()
+                        with open(cache_file, "wb") as f:
+                            f.write(raw_data)
+                    except Exception as e:
+                        logging.error(f"Failed to fetch EPG source {url}: {e}")
+                        continue
+                
                 try:
-                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, timeout=60) as response:
-                        raw_data = response.read()
                     
                     self.signals.progress.emit(f"Decompressing source {i+1}...")
                     if url.endswith(".gz"):
@@ -760,7 +796,7 @@ class PlaylistProxyModel(QSortFilterProxyModel):
         if self.show_favorites_only and not entry.favorite:
             return False
 
-        # Health Filter
+        # Health Filter (Status)
         if self.filter_health != "All Health":
             val_data = model.validation_data.get(id(entry))
             is_valid = val_data[2] if val_data else None
@@ -774,11 +810,13 @@ class PlaylistProxyModel(QSortFilterProxyModel):
             if self.filter_health == "Valid" and is_valid is not True: return False
             if self.filter_health == "Invalid" and is_valid is not False: return False
             if self.filter_health == "Untested" and is_valid is not None: return False
-
-        name_match = self.filter_text.lower() in entry.name.lower()
+            
+        # Text Filter (Name OR Group)
+        txt = self.filter_text.lower()
+        text_match = txt in entry.name.lower() or txt in entry.group.lower()
         group_match = (self.filter_group == "All Groups" or entry.group == self.filter_group)
         
-        return name_match and group_match
+        return text_match and group_match
 
     def flags(self, index):
         if not index.isValid():
@@ -834,7 +872,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, current_path=""):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(400, 100)
+        self.resize(400, 150)
         self.vlc_path = current_path
         
         layout = QVBoxLayout(self)
@@ -851,6 +889,14 @@ class SettingsDialog(QDialog):
         form.addRow("VLC Path:", row_layout)
         layout.addLayout(form)
         
+        # Cache section
+        cache_layout = QHBoxLayout()
+        self.btn_clear_cache = QPushButton("Clear EPG Cache")
+        self.btn_clear_cache.clicked.connect(self.clear_cache)
+        cache_layout.addWidget(QLabel("EPG Data:"))
+        cache_layout.addWidget(self.btn_clear_cache)
+        layout.addLayout(cache_layout)
+        
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -863,6 +909,18 @@ class SettingsDialog(QDialog):
             
     def get_path(self):
         return self.path_edit.text()
+
+    def clear_cache(self):
+        cache_dir = os.path.join(os.getcwd(), "epg_cache")
+        if os.path.exists(cache_dir):
+            try:
+                shutil.rmtree(cache_dir)
+                os.makedirs(cache_dir, exist_ok=True)
+                QMessageBox.information(self, "Success", "EPG Cache cleared successfully.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to clear cache: {e}")
+        else:
+            QMessageBox.information(self, "Info", "Cache directory is empty or does not exist.")
 
 class SaveOptionsDialog(QDialog):
     def __init__(self, parent=None):
@@ -994,6 +1052,333 @@ class ChannelNumberingDialog(QDialog):
     def get_settings(self):
         return (self.start_num.value(), self.sort_group.isChecked(), 
                 self.reset_group.isChecked(), self.target_combo.currentIndex())
+
+class MergeStrategyDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load Strategy")
+        self.resize(350, 180)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Current playlist is not empty. Choose action:"))
+        
+        self.rb_replace = QRadioButton("Replace current playlist")
+        self.rb_append = QRadioButton("Append to current playlist")
+        self.rb_dedupe = QRadioButton("Append and Deduplicate (by URL)")
+        
+        self.rb_replace.setChecked(True)
+        
+        layout.addWidget(self.rb_replace)
+        layout.addWidget(self.rb_append)
+        layout.addWidget(self.rb_dedupe)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_strategy(self):
+        if self.rb_replace.isChecked(): return "replace"
+        if self.rb_append.isChecked(): return "append"
+        if self.rb_dedupe.isChecked(): return "dedupe"
+        return "replace"
+
+class CastDiscoverySignals(QObject):
+    found = pyqtSignal(object)
+    finished = pyqtSignal()
+
+class CastDiscoveryWorker(QRunnable):
+    """Worker to discover Chromecast devices."""
+    def __init__(self):
+        super().__init__()
+        self.signals = CastDiscoverySignals()
+
+    def run(self):
+        try:
+            # Discover devices (timeout=5s by default)
+            casts, browser = pychromecast.get_chromecasts()
+            for cast in casts:
+                self.signals.found.emit(cast)
+        except Exception as e:
+            logging.error(f"Discovery error: {e}")
+        finally:
+            self.signals.finished.emit()
+
+class NetworkScannerSignals(QObject):
+    found = pyqtSignal(str, str) # name, location
+    finished = pyqtSignal()
+
+class NetworkScannerWorker(QRunnable):
+    """Worker to scan for UPnP/DLNA devices via SSDP."""
+    def __init__(self):
+        super().__init__()
+        self.signals = NetworkScannerSignals()
+
+    def run(self):
+        msg = \
+            'M-SEARCH * HTTP/1.1\r\n' \
+            'HOST:239.255.255.250:1900\r\n' \
+            'ST:upnp:rootdevice\r\n' \
+            'MX:2\r\n' \
+            'MAN:"ssdp:discover"\r\n' \
+            '\r\n'
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.settimeout(3)
+            sock.sendto(msg.encode('utf-8'), ('239.255.255.250', 1900))
+
+            found_devices = set()
+            start_time = time.time()
+
+            while time.time() - start_time < 5: # Scan for 5 seconds
+                try:
+                    data, addr = sock.recvfrom(65507)
+                    headers = self.parse_headers(data.decode('utf-8', errors='ignore'))
+                    
+                    location = headers.get('LOCATION', '')
+                    server = headers.get('SERVER', 'Unknown Device')
+                    usn = headers.get('USN', '')
+
+                    if location and usn not in found_devices:
+                        found_devices.add(usn)
+                        self.signals.found.emit(server, location)
+                except socket.timeout:
+                    break
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"SSDP Scan error: {e}")
+        finally:
+            self.signals.finished.emit()
+
+    def parse_headers(self, data):
+        headers = {}
+        lines = data.split('\r\n')
+        for line in lines:
+            if ':' in line:
+                key, val = line.split(':', 1)
+                headers[key.upper()] = val.strip()
+        return headers
+
+class NetworkScannerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Network Stream Scanner")
+        self.resize(500, 400)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Scanning local network for UPnP/DLNA devices..."))
+        
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def add_device(self, name, location):
+        item = QListWidgetItem(f"{name}\n{location}")
+        item.setData(Qt.ItemDataRole.UserRole, location)
+        self.list_widget.addItem(item)
+
+class CastManagerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cast Manager")
+        self.resize(350, 180)
+        self.parent_window = parent
+        
+        layout = QVBoxLayout(self)
+        
+        if not self.parent_window or not getattr(self.parent_window, 'active_cast', None):
+            layout.addWidget(QLabel("No active casting session."))
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(self.accept)
+            layout.addWidget(btn_close)
+            return
+
+        cast = self.parent_window.active_cast
+        url = getattr(self.parent_window, 'active_cast_url', 'Unknown')
+        
+        layout.addWidget(QLabel(f"Connected Device: <b>{cast.name}</b>"))
+        layout.addWidget(QLabel(f"Model: {cast.model_name}"))
+        
+        url_lbl = QLabel(f"Stream: {url}")
+        url_lbl.setWordWrap(True)
+        layout.addWidget(url_lbl)
+        
+        btn_layout = QHBoxLayout()
+        
+        btn_restart = QPushButton("Restart Media")
+        btn_restart.clicked.connect(self.restart_cast)
+        
+        btn_stop = QPushButton("Stop Casting")
+        btn_stop.clicked.connect(self.stop_cast)
+        
+        btn_layout.addWidget(btn_restart)
+        btn_layout.addWidget(btn_stop)
+        layout.addLayout(btn_layout)
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def restart_cast(self):
+        if self.parent_window and self.parent_window.active_cast:
+            cast = self.parent_window.active_cast
+            url = getattr(self.parent_window, 'active_cast_url', None)
+            if url:
+                try:
+                    mc = cast.media_controller
+                    mc.play_media(url, 'video/mp4')
+                    QMessageBox.information(self, "Success", "Media restarted.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to restart: {e}")
+
+    def stop_cast(self):
+        if self.parent_window and self.parent_window.active_cast:
+            try:
+                self.parent_window.active_cast.quit_app()
+                self.parent_window.active_cast = None
+                self.parent_window.active_cast_url = None
+                QMessageBox.information(self, "Success", "Casting stopped.")
+                self.accept()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to stop: {e}")
+
+class CastDialog(QDialog):
+    def __init__(self, url, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cast Stream")
+        self.url = url
+        self.resize(350, 250)
+        self.casts = {} # name -> cast_obj
+        self.active_cast = getattr(parent, 'active_cast', None) if parent else None
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Scanning for Cast devices (Chromecast/DLNA)..."))
+        
+        self.device_list = QListWidget()
+        layout.addWidget(self.device_list)
+        
+        self.status_lbl = QLabel("Initializing...")
+        self.status_lbl.setStyleSheet("color: #89b4fa;")
+        layout.addWidget(self.status_lbl)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_cast = QPushButton("Cast")
+        self.btn_cast.setEnabled(False)
+        self.btn_cast.clicked.connect(self.start_casting)
+        
+        self.btn_stop = QPushButton("Stop Casting")
+        self.btn_stop.setEnabled(self.active_cast is not None)
+        self.btn_stop.clicked.connect(self.stop_casting)
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(self.btn_cast)
+        btn_layout.addWidget(self.btn_stop)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+        
+        # Start scan after a brief delay to allow UI to show
+        QTimer.singleShot(100, self.scan_devices)
+
+    def scan_devices(self):
+        if not HAS_CHROMECAST:
+            self.status_lbl.setText("Error: 'pychromecast' not installed.")
+            self.device_list.addItem("Please run: pip install pychromecast")
+            return
+
+        self.status_lbl.setText("Scanning network...")
+        worker = CastDiscoveryWorker()
+        worker.signals.found.connect(self.on_device_found)
+        worker.signals.finished.connect(self.on_scan_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def on_device_found(self, cast):
+        if cast.name not in self.casts:
+            self.casts[cast.name] = cast
+            self.device_list.addItem(cast.name)
+            self.btn_cast.setEnabled(True)
+
+    def on_scan_finished(self):
+        count = self.device_list.count()
+        self.status_lbl.setText(f"Scan complete. Found {count} devices.")
+
+    def start_casting(self):
+        item = self.device_list.currentItem()
+        if not item: return
+        
+        name = item.text()
+        cast = self.casts.get(name)
+        
+        if cast:
+            self.status_lbl.setText(f"Connecting to {name}...")
+            QApplication.processEvents()
+            try:
+                cast.wait()
+                mc = cast.media_controller
+                mc.play_media(self.url, 'video/mp4')
+                mc.block_until_active()
+                
+                # Store active cast in root window (M3UEditorWindow)
+                root = self.parent()
+                while root and not hasattr(root, 'thread_pool'): # Heuristic to find M3UEditorWindow
+                    root = root.parent()
+                if root:
+                    root.active_cast = cast
+                    root.active_cast_url = self.url
+                
+                QMessageBox.information(self, "Success", f"Casting started on {name}")
+                self.accept()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to cast: {str(e)}")
+                self.status_lbl.setText("Error connecting.")
+
+    def stop_casting(self):
+        # Find root window
+        root = self.parent()
+        while root and not hasattr(root, 'thread_pool'):
+            root = root.parent()
+        if root and getattr(root, 'active_cast', None):
+            root.active_cast.quit_app()
+            root.active_cast = None
+            root.active_cast_url = None
+            self.accept()
+
+class SmartDedupeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Smart Dedupe")
+        self.resize(400, 200)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Remove duplicates based on:"))
+        
+        self.rb_name = QRadioButton("Channel Name (Keep highest quality/metadata)")
+        self.rb_url = QRadioButton("Stream URL (Keep entry with most metadata)")
+        self.rb_name.setChecked(True)
+        
+        layout.addWidget(self.rb_name)
+        layout.addWidget(self.rb_url)
+        
+        self.cb_ignore_case = QCheckBox("Ignore Case")
+        self.cb_ignore_case.setChecked(True)
+        layout.addWidget(self.cb_ignore_case)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def get_options(self):
+        return (
+            "name" if self.rb_name.isChecked() else "url",
+            self.cb_ignore_case.isChecked()
+        )
 
 class StoryboardWidget(QWidget):
     """Widget to generate and display a storyboard of frames from a stream."""
@@ -1152,6 +1537,41 @@ class StreamPreviewDialog(QDialog):
         self.btn_next.clicked.connect(self.next_channel)
         controls_layout.addWidget(self.btn_next)
         
+        # Playback Speed
+        self.combo_speed = QComboBox()
+        self.combo_speed.addItems(["0.5x", "1.0x", "1.5x", "2.0x"])
+        self.combo_speed.setCurrentIndex(1) # 1.0x
+        self.combo_speed.setToolTip("Playback Speed")
+        self.combo_speed.setFixedWidth(70)
+        self.combo_speed.currentTextChanged.connect(self.set_playback_speed)
+        controls_layout.addWidget(self.combo_speed)
+
+        # Aspect Ratio
+        self.combo_aspect = QComboBox()
+        self.combo_aspect.addItems(["Fit", "Stretch", "Zoom"])
+        self.combo_aspect.setToolTip("Aspect Ratio")
+        self.combo_aspect.setFixedWidth(80)
+        self.combo_aspect.currentIndexChanged.connect(self.set_aspect_ratio)
+        controls_layout.addWidget(self.combo_aspect)
+
+        # Audio Tracks
+        self.combo_audio = QComboBox()
+        self.combo_audio.setToolTip("Audio Track")
+        self.combo_audio.setFixedWidth(80)
+        self.combo_audio.addItem("Audio")
+        self.combo_audio.setEnabled(False)
+        self.combo_audio.activated.connect(self.set_audio_track)
+        controls_layout.addWidget(self.combo_audio)
+
+        # Subtitles
+        self.combo_subs = QComboBox()
+        self.combo_subs.setToolTip("Subtitles")
+        self.combo_subs.setFixedWidth(80)
+        self.combo_subs.addItem("No Subs")
+        self.combo_subs.setEnabled(False)
+        self.combo_subs.activated.connect(self.set_subtitle_track)
+        controls_layout.addWidget(self.combo_subs)
+
         controls_layout.addStretch()
         
         # Volume Control
@@ -1173,6 +1593,26 @@ class StreamPreviewDialog(QDialog):
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         controls_layout.addWidget(self.btn_fullscreen)
         
+        # Cast Button
+        self.btn_cast = QPushButton()
+        self.btn_cast.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.btn_cast.setToolTip("Cast Stream")
+        self.btn_cast.clicked.connect(self.open_cast_dialog)
+        controls_layout.addWidget(self.btn_cast)
+        
+        # Snapshot
+        self.btn_snapshot = QPushButton()
+        self.btn_snapshot.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.btn_snapshot.setToolTip("Take Snapshot")
+        self.btn_snapshot.clicked.connect(self.take_snapshot)
+        controls_layout.addWidget(self.btn_snapshot)
+
+        # Always on Top
+        self.chk_on_top = QCheckBox("On Top")
+        self.chk_on_top.setToolTip("Keep window always on top")
+        self.chk_on_top.toggled.connect(self.toggle_always_on_top)
+        controls_layout.addWidget(self.chk_on_top)
+
         live_layout.addLayout(controls_layout)
         
         # Stream Info
@@ -1181,12 +1621,23 @@ class StreamPreviewDialog(QDialog):
         self.lbl_name = QLabel(self.entry.name)
         self.input_group = QLineEdit(self.entry.group)
         self.input_group.textChanged.connect(self.on_group_changed)
+        
         self.lbl_url = QLabel(self.entry.url)
         self.lbl_url.setWordWrap(True)
+        
+        self.btn_copy_url = QPushButton("Copy")
+        self.btn_copy_url.setFixedWidth(60)
+        self.btn_copy_url.setToolTip("Copy URL to clipboard")
+        self.btn_copy_url.clicked.connect(self.copy_url_to_clipboard)
+        
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(self.lbl_url)
+        url_layout.addWidget(self.btn_copy_url)
+        
         self.lbl_security = QLabel("Not Audited")
         self.info_layout.addRow("Name:", self.lbl_name)
         self.info_layout.addRow("Group:", self.input_group)
-        self.info_layout.addRow("URL:", self.lbl_url)
+        self.info_layout.addRow("URL:", url_layout)
         self.info_layout.addRow("Security:", self.lbl_security)
         live_layout.addWidget(self.info_group)
         
@@ -1225,6 +1676,7 @@ class StreamPreviewDialog(QDialog):
         self.player.errorOccurred.connect(self.handle_error)
         self.player.playbackStateChanged.connect(self.on_playback_state_changed)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.tracksChanged.connect(self.update_track_lists)
         
         # Start Playback
         self.load_entry(self.current_index)
@@ -1235,6 +1687,10 @@ class StreamPreviewDialog(QDialog):
             
         self.current_index = index
         self.entry = self.entries[self.current_index]
+        
+        # Add to Recent Streams in Main Window
+        if self.parent() and hasattr(self.parent(), 'add_recent_stream'):
+            self.parent().add_recent_stream(self.entry)
         
         self.setWindowTitle(f"Preview: {self.entry.name}")
         self.lbl_name.setText(self.entry.name)
@@ -1365,6 +1821,82 @@ class StreamPreviewDialog(QDialog):
         else:
             self.video_widget.showFullScreen()
             self.btn_fullscreen.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
+
+    def set_playback_speed(self, text):
+        speed = float(text.replace("x", ""))
+        self.player.setPlaybackRate(speed)
+
+    def set_aspect_ratio(self, index):
+        modes = [Qt.AspectRatioMode.KeepAspectRatio, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.AspectRatioMode.KeepAspectRatioByExpanding]
+        self.video_widget.setAspectRatioMode(modes[index])
+
+    def update_track_lists(self):
+        # Audio
+        self.combo_audio.blockSignals(True)
+        self.combo_audio.clear()
+        try:
+            audio_tracks = self.player.audioTracks()
+            if audio_tracks:
+                for i, track in enumerate(audio_tracks):
+                    lang = track.stringValue(QMediaMetaData.Key.Language) or f"Track {i+1}"
+                    self.combo_audio.addItem(lang, i)
+                self.combo_audio.setCurrentIndex(self.player.activeAudioTrack())
+                self.combo_audio.setEnabled(True)
+            else:
+                self.combo_audio.addItem("Default")
+                self.combo_audio.setEnabled(False)
+        except Exception:
+             self.combo_audio.addItem("Audio N/A")
+             self.combo_audio.setEnabled(False)
+        self.combo_audio.blockSignals(False)
+        
+        # Subtitles
+        self.combo_subs.blockSignals(True)
+        self.combo_subs.clear()
+        try:
+            sub_tracks = self.player.subtitleTracks()
+            if sub_tracks:
+                for i, track in enumerate(sub_tracks):
+                    lang = track.stringValue(QMediaMetaData.Key.Language) or f"Sub {i+1}"
+                    self.combo_subs.addItem(lang, i)
+                self.combo_subs.setCurrentIndex(self.player.activeSubtitleTrack())
+                self.combo_subs.setEnabled(True)
+            else:
+                self.combo_subs.addItem("No Subs")
+                self.combo_subs.setEnabled(False)
+        except Exception:
+             self.combo_subs.addItem("Subs N/A")
+             self.combo_subs.setEnabled(False)
+        self.combo_subs.blockSignals(False)
+
+    def set_audio_track(self, index):
+        self.player.setActiveAudioTrack(index)
+
+    def set_subtitle_track(self, index):
+        self.player.setActiveSubtitleTrack(index)
+
+    def toggle_always_on_top(self, checked):
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, checked)
+        self.show()
+
+    def take_snapshot(self):
+        pixmap = self.video_widget.grab()
+        if not pixmap.isNull():
+            filename, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png", "Images (*.png *.jpg)")
+            if filename:
+                pixmap.save(filename)
+                self.status_overlay.setText("Snapshot Saved")
+                self.status_overlay.setVisible(True)
+                QTimer.singleShot(1500, lambda: self.status_overlay.setVisible(False))
+
+    def open_cast_dialog(self):
+        dlg = CastDialog(self.entry.url, self)
+        dlg.exec()
+
+    def copy_url_to_clipboard(self):
+        QApplication.clipboard().setText(self.entry.url)
+        self.btn_copy_url.setText("Copied!")
+        QTimer.singleShot(2000, lambda: self.btn_copy_url.setText("Copy"))
 
     def handle_error(self, error, error_str):
         self.status_overlay.setText(f"Error: {error_str}")
@@ -1594,6 +2126,7 @@ class StatisticsDialog(QDialog):
         self.create_group_tab()
         self.create_resolution_tab()
         self.create_health_tab()
+        self.create_latency_tab()
         
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         btn_box.rejected.connect(self.reject)
@@ -1668,6 +2201,71 @@ class StatisticsDialog(QDialog):
         tab = self.create_table(counts, ["Status", "Count", "Distribution"])
         self.tabs.addTab(tab, "Health")
 
+    def create_latency_tab(self):
+        # Parse latencies from names (format: "Name [123ms]")
+        latencies = []
+        pattern = re.compile(r'\[(\d+)ms\]')
+        
+        for entry in self.entries:
+            match = pattern.search(entry.name)
+            if match:
+                latencies.append((entry.name, int(match.group(1))))
+            else:
+                latencies.append((entry.name, None))
+        
+        # Create container
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        
+        # Summary Table
+        counts = {"< 200ms (Excellent)": 0, "200-500ms (Good)": 0, "500-1000ms (Fair)": 0, "> 1000ms (Poor)": 0, "Unknown": 0}
+        
+        for _, lat in latencies:
+            if lat is None: counts["Unknown"] += 1
+            elif lat < 200: counts["< 200ms (Excellent)"] += 1
+            elif lat < 500: counts["200-500ms (Good)"] += 1
+            elif lat < 1000: counts["500-1000ms (Fair)"] += 1
+            else: counts["> 1000ms (Poor)"] += 1
+            
+        table = self.create_table(counts, ["Range", "Count", "Distribution"])
+        table.setMaximumHeight(150)
+        layout.addWidget(table)
+        
+        layout.addWidget(QLabel("Latency Heatmap (Hover for details):"))
+        
+        # Heatmap Grid
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        grid_widget = QWidget()
+        grid_layout = QGridLayout(grid_widget)
+        grid_layout.setSpacing(2)
+        grid_layout.setContentsMargins(0,0,0,0)
+        
+        cols = 25
+        for i, (name, lat) in enumerate(latencies):
+            block = QLabel()
+            block.setFixedSize(15, 15)
+            
+            color = "#313244" # Unknown (Grey)
+            if lat is not None:
+                if lat < 200: color = "#a6e3a1" # Green
+                elif lat < 500: color = "#f9e2af" # Yellow
+                elif lat < 1000: color = "#fab387" # Orange
+                else: color = "#f38ba8" # Red
+            
+            block.setStyleSheet(f"background-color: {color}; border-radius: 2px;")
+            block.setToolTip(f"{name}")
+            
+            grid_layout.addWidget(block, i // cols, i % cols)
+            
+        # Add spacer to push grid to top
+        grid_layout.setRowStretch((len(latencies) // cols) + 1, 1)
+        
+        scroll.setWidget(grid_widget)
+        layout.addWidget(scroll)
+        
+        self.tabs.addTab(container, "Latency")
+
 class XtreamLoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1697,6 +2295,437 @@ class XtreamLoginDialog(QDialog):
         if url and not url.startswith("http"):
             url = "http://" + url
         return url, self.user_edit.text().strip(), self.pass_edit.text().strip()
+
+class IPTVPlayerWindow(QMainWindow):
+    """Full-screen IPTV Player interface."""
+    def __init__(self, entries, current_index=0, parent=None):
+        super().__init__(parent)
+        self.entries = entries
+        self.current_index = current_index
+        self.setWindowTitle("IPTV Player Mode")
+        self.resize(1280, 720)
+        self.setStyleSheet("background-color: black;")
+        
+        # Player Setup
+        self.player = QMediaPlayer()
+        self.audio = QAudioOutput()
+        self.player.setAudioOutput(self.audio)
+        self.audio.setVolume(1.0)
+        
+        self.video_widget = QVideoWidget()
+        self.setCentralWidget(self.video_widget)
+        self.player.setVideoOutput(self.video_widget)
+        
+        # Channel List Dock (Overlay)
+        self.dock = QDockWidget("Channels", self)
+        self.dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        
+        dock_content = QWidget()
+        dock_layout = QVBoxLayout(dock_content)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search channels...")
+        self.search_bar.setStyleSheet("background-color: #181825; color: #cdd6f4; border: 1px solid #313244; padding: 4px;")
+        self.search_bar.textChanged.connect(self.filter_channels)
+        dock_layout.addWidget(self.search_bar)
+        
+        self.channel_list = QListWidget()
+        self.channel_list.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; border: none;")
+        dock_layout.addWidget(self.channel_list)
+        
+        self.dock.setWidget(dock_content)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.dock)
+        
+        # Populate list
+        for i, entry in enumerate(self.entries):
+            item = QListWidgetItem(f"{i+1}. {entry.name}")
+            self.channel_list.addItem(item)
+            
+        self.channel_list.setCurrentRow(self.current_index)
+        self.channel_list.itemClicked.connect(self.on_channel_clicked)
+        
+        self.player.errorOccurred.connect(lambda: self.statusBar().showMessage("Error playing stream"))
+        
+        # Start Playback
+        self.play_current()
+        
+        # PiP State
+        self.is_pip = False
+        self.old_geometry = None
+        self.old_flags = None
+        self.drag_pos = None
+        
+        # Context Menu
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+    def play_current(self):
+        if 0 <= self.current_index < len(self.entries):
+            entry = self.entries[self.current_index]
+            
+            # Add to Recent Streams in Main Window
+            if self.parent() and hasattr(self.parent(), 'add_recent_stream'):
+                self.parent().add_recent_stream(entry)
+            
+            self.setWindowTitle(f"IPTV Player - {entry.name}")
+            self.player.setSource(QUrl(entry.url))
+            self.player.play()
+            self.channel_list.setCurrentRow(self.current_index)
+            
+    def filter_channels(self, text):
+        for i in range(self.channel_list.count()):
+            item = self.channel_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+
+    def toggle_pip(self):
+        if not self.is_pip:
+            # Enter PiP
+            self.old_geometry = self.saveGeometry()
+            self.old_flags = self.windowFlags()
+            self.is_pip = True
+            
+            self.dock.setVisible(False)
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+            
+            screen = self.screen().availableGeometry()
+            w, h = 480, 270
+            x = screen.width() - w - 20
+            y = screen.height() - h - 20
+            self.setGeometry(x, y, w, h)
+            self.show()
+        else:
+            # Exit PiP
+            self.is_pip = False
+            self.setWindowFlags(self.old_flags)
+            self.restoreGeometry(self.old_geometry)
+            self.show()
+
+    def show_context_menu(self, position):
+        menu = QMenu(self)
+        
+        pip_action = QAction("Toggle PiP Mode", self)
+        pip_action.setCheckable(True)
+        pip_action.setChecked(self.is_pip)
+        pip_action.triggered.connect(self.toggle_pip)
+        menu.addAction(pip_action)
+        
+        fs_action = QAction("Toggle Fullscreen", self)
+        fs_action.triggered.connect(lambda: self.setWindowState(self.windowState() ^ Qt.WindowState.WindowFullScreen))
+        menu.addAction(fs_action)
+        
+        cast_action = QAction("Cast Stream...", self)
+        cast_action.triggered.connect(self.open_cast_dialog)
+        menu.addAction(cast_action)
+        
+        snap_action = QAction("Take Snapshot", self)
+        snap_action.triggered.connect(self.take_snapshot)
+        menu.addAction(snap_action)
+        
+        menu.addSeparator()
+        
+        menu.addAction("Close", self.close)
+        menu.exec(self.mapToGlobal(position))
+
+    def on_channel_clicked(self, item):
+        self.current_index = self.channel_list.row(item)
+        self.play_current()
+        
+    def take_snapshot(self):
+        pixmap = self.video_widget.grab()
+        if not pixmap.isNull():
+            filename, _ = QFileDialog.getSaveFileName(self, "Save Snapshot", f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png", "Images (*.png *.jpg)")
+            if filename:
+                pixmap.save(filename)
+                self.statusBar().showMessage(f"Snapshot saved to {filename}", 3000)
+
+    def open_cast_dialog(self):
+        dlg = CastDialog(self.entries[self.current_index].url, self)
+        dlg.exec()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+            else:
+                self.player.play()
+        elif event.key() == Qt.Key.Key_Up:
+            if self.current_index > 0:
+                self.current_index -= 1
+                self.play_current()
+        elif event.key() == Qt.Key.Key_Down:
+            if self.current_index < len(self.entries) - 1:
+                self.current_index += 1
+                self.play_current()
+        elif event.key() == Qt.Key.Key_F or event.key() == Qt.Key.Key_F11:
+            self.setWindowState(self.windowState() ^ Qt.WindowState.WindowFullScreen)
+        elif event.key() == Qt.Key.Key_Escape:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.close()
+        elif event.key() == Qt.Key.Key_P:
+            self.toggle_pip()
+        elif event.key() == Qt.Key.Key_L:
+            self.dock.setVisible(not self.dock.isVisible())
+        else:
+            super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        if self.is_pip and event.button() == Qt.MouseButton.LeftButton:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.is_pip and event.buttons() & Qt.MouseButton.LeftButton and self.drag_pos:
+            self.move(event.globalPosition().toPoint() - self.drag_pos)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+            
+    def mouseReleaseEvent(self, event):
+        self.drag_pos = None
+        super().mouseReleaseEvent(event)
+            
+    def closeEvent(self, event):
+        self.player.stop()
+        super().closeEvent(event)
+
+class SpeedTestSignals(QObject):
+    progress = pyqtSignal(int)
+    result = pyqtSignal(str)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+class SpeedTestWorker(QRunnable):
+    """Worker to measure download speed."""
+    def __init__(self):
+        super().__init__()
+        self.signals = SpeedTestSignals()
+
+    def run(self):
+        # Use a reliable speed test file (10MB)
+        url = "http://speedtest.tele2.net/10MB.zip"
+        try:
+            start_time = time.time()
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                file_size = int(response.getheader('Content-Length', 10 * 1024 * 1024))
+                downloaded = 0
+                block_size = 8192
+                while True:
+                    buffer = response.read(block_size)
+                    if not buffer:
+                        break
+                    downloaded += len(buffer)
+                    progress = int((downloaded / file_size) * 100)
+                    self.signals.progress.emit(progress)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            if duration <= 0: duration = 0.1
+            
+            # Calculate speed: (bytes * 8) / duration / 1,000,000 = Mbps
+            speed_mbps = (downloaded * 8) / duration / 1_000_000
+            self.signals.result.emit(f"{speed_mbps:.2f} Mbps")
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
+
+class SpeedTestDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Network Speed Test")
+        self.resize(300, 150)
+        layout = QVBoxLayout(self)
+        
+        self.lbl_status = QLabel("Ready to test download speed.")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(self.lbl_status)
+        
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+        
+        self.btn_start = QPushButton("Start Test")
+        self.btn_start.clicked.connect(self.start_test)
+        layout.addWidget(self.btn_start)
+        
+    def start_test(self):
+        self.btn_start.setEnabled(False)
+        self.lbl_status.setText("Downloading...")
+        self.progress.setValue(0)
+        
+        worker = SpeedTestWorker()
+        worker.signals.progress.connect(self.progress.setValue)
+        worker.signals.result.connect(self.show_result)
+        worker.signals.error.connect(self.show_error)
+        worker.signals.finished.connect(lambda: self.btn_start.setEnabled(True))
+        QThreadPool.globalInstance().start(worker)
+        
+    def show_result(self, speed):
+        self.lbl_status.setText(f"Speed: {speed}")
+        
+    def show_error(self, err):
+        self.lbl_status.setText("Error occurred")
+        QMessageBox.warning(self, "Error", f"Speed test failed: {err}")
+
+class LogoWizardSignals(QObject):
+    progress = pyqtSignal(int)
+    found = pyqtSignal(int, str) # row_index, url
+    finished = pyqtSignal(int) # count
+
+class LogoWizardWorker(QRunnable):
+    """Worker to match logos from a repository."""
+    def __init__(self, entries, base_url):
+        super().__init__()
+        self.entries = entries # List of (row_index, name)
+        self.base_url = base_url
+        self.signals = LogoWizardSignals()
+
+    def run(self):
+        found_count = 0
+        total = len(self.entries)
+        for i, (row, name) in enumerate(self.entries):
+            # Sanitize: remove special chars, lower case
+            safe_name = re.sub(r'[^a-z0-9]', '', name.lower())
+            if safe_name:
+                url = f"{self.base_url}{safe_name}.png"
+                try:
+                    req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        if 200 <= resp.status < 400:
+                            self.signals.found.emit(row, url)
+                            found_count += 1
+                except:
+                    pass
+            self.signals.progress.emit(int(((i + 1) / total) * 100))
+        self.signals.finished.emit(found_count)
+
+class FFmpegSignals(QObject):
+    output = pyqtSignal(str)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+class FFmpegWorker(QRunnable):
+    """Generic worker for FFmpeg tasks (Transcode/Record)."""
+    def __init__(self, command):
+        super().__init__()
+        self.command = command
+        self.signals = FFmpegSignals()
+
+    def run(self):
+        try:
+            # Run ffmpeg, capturing stderr (where it writes stats)
+            process = subprocess.Popen(
+                self.command, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    self.signals.output.emit(line.strip())
+            
+            if process.returncode == 0:
+                self.signals.finished.emit()
+            else:
+                self.signals.error.emit(f"Process exited with code {process.returncode}")
+                
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+class TranscodeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Transcode Wizard")
+        self.resize(400, 200)
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP4 (H.264/AAC)", "MKV (Copy)", "TS (Copy)"])
+        
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"])
+        self.preset_combo.setCurrentText("fast")
+        
+        form.addRow("Output Format:", self.format_combo)
+        form.addRow("Encoding Preset:", self.preset_combo)
+        layout.addLayout(form)
+        
+        self.btn_dest = QPushButton("Select Output Folder")
+        self.btn_dest.clicked.connect(self.select_folder)
+        layout.addWidget(self.btn_dest)
+        self.dest_label = QLabel("No folder selected")
+        layout.addWidget(self.dest_label)
+        self.output_dir = ""
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def select_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if d:
+            self.output_dir = d
+            self.dest_label.setText(d)
+            
+    def get_settings(self):
+        return self.format_combo.currentIndex(), self.preset_combo.currentText(), self.output_dir
+
+class ScheduledRecordingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Recording")
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        
+        self.start_time = QDateTimeEdit(QDateTime.currentDateTime())
+        self.start_time.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.start_time.setCalendarPopup(True)
+        
+        self.duration = QSpinBox()
+        self.duration.setRange(1, 1440) # Up to 24 hours
+        self.duration.setValue(60)
+        self.duration.setSuffix(" min")
+        
+        form.addRow("Start Time:", self.start_time)
+        form.addRow("Duration:", self.duration)
+        layout.addLayout(form)
+        
+        self.btn_dest = QPushButton("Select Output File")
+        self.btn_dest.clicked.connect(self.select_file)
+        layout.addWidget(self.btn_dest)
+        self.dest_label = QLabel("No file selected")
+        layout.addWidget(self.dest_label)
+        self.output_file = ""
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        
+    def select_file(self):
+        f, _ = QFileDialog.getSaveFileName(self, "Save Recording", "recording.mp4", "Video Files (*.mp4 *.ts *.mkv)")
+        if f:
+            self.output_file = f
+            self.dest_label.setText(f)
+            
+    def get_settings(self):
+        return self.start_time.dateTime(), self.duration.value(), self.output_file
 
 # -----------------------------------------------------------------------------
 # GUI Implementation
@@ -1789,6 +2818,7 @@ class M3UEditorWindow(QMainWindow):
         self.recent_files = self.settings.value("recent_files", [], type=list)
         self.epg_urls = self.settings.value("epg_urls", [], type=list)
         # Migration from single url
+        self.epg_url = ""
         old_url = self.settings.value("epg_url", "")
         if old_url and not self.epg_urls:
             self.epg_urls = [old_url]
@@ -1807,6 +2837,10 @@ class M3UEditorWindow(QMainWindow):
         
         self.init_ui()
         self.model.logo_loader = self.logo_loader
+        self.iptv_window = None
+        self.scheduled_timers = [] # Keep references to timers
+        self.active_cast = None # Currently connected Chromecast
+        self.active_cast_url = None
 
     def init_ui(self):
         # Main Layout
@@ -1901,6 +2935,21 @@ class M3UEditorWindow(QMainWindow):
         toolbar.addWidget(self.search_bar)
         
         main_layout.addLayout(toolbar)
+
+        # --- Quick Filter Toolbar ---
+        qf_layout = QHBoxLayout()
+        qf_layout.setContentsMargins(0, 0, 0, 5)
+        qf_layout.addWidget(QLabel("Quick Filter:"))
+        
+        categories = ["Sports", "News", "Movies", "Kids", "Music", "Documentary"]
+        for cat in categories:
+            btn = QPushButton(cat)
+            btn.setFlat(True)
+            btn.setStyleSheet("QPushButton { border: 1px solid #45475a; padding: 2px 8px; margin-right: 2px; } QPushButton:hover { background-color: #45475a; }")
+            btn.clicked.connect(lambda checked, c=cat: self.search_bar.setText(c))
+            qf_layout.addWidget(btn)
+        qf_layout.addStretch()
+        main_layout.addLayout(qf_layout)
 
         # --- Splitter for Table and Editor ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2045,6 +3094,14 @@ class M3UEditorWindow(QMainWindow):
         self.tabs.addTab(actions_tab, "Actions")
         self.tabs.addTab(history_tab, "History")
         
+        # -- Tab 5: Recent --
+        recent_tab = QWidget()
+        recent_layout = QVBoxLayout(recent_tab)
+        self.recent_list = QListWidget()
+        self.recent_list.itemDoubleClicked.connect(self.on_recent_item_double_clicked)
+        recent_layout.addWidget(self.recent_list)
+        self.tabs.addTab(recent_tab, "Recent")
+        
         splitter.addWidget(self.tabs)
         
         # Set initial sizes for splitter (70% table, 30% editor)
@@ -2065,6 +3122,11 @@ class M3UEditorWindow(QMainWindow):
         
         # File Menu
         file_menu = menubar.addMenu("File")
+        
+        new_action = QAction("New", self)
+        new_action.setShortcut("Ctrl+N")
+        new_action.triggered.connect(self.new_file)
+        file_menu.addAction(new_action)
         
         load_action = QAction("Load M3U File", self)
         load_action.triggered.connect(self.load_m3u)
@@ -2094,6 +3156,11 @@ class M3UEditorWindow(QMainWindow):
         restore_action = QAction("Restore Backup...", self)
         restore_action.triggered.connect(self.restore_backup)
         file_menu.addAction(restore_action)
+        
+        close_action = QAction("Close File", self)
+        close_action.setShortcut("Ctrl+W")
+        close_action.triggered.connect(self.close_file)
+        file_menu.addAction(close_action)
         
         # Recent Files Submenu
         self.recent_menu = file_menu.addMenu("Open Recent")
@@ -2136,9 +3203,17 @@ class M3UEditorWindow(QMainWindow):
         dup_action.triggered.connect(self.find_duplicates)
         tools_menu.addAction(dup_action)
         
+        smart_dedupe_action = QAction("Smart Dedupe...", self)
+        smart_dedupe_action.triggered.connect(self.smart_dedupe)
+        tools_menu.addAction(smart_dedupe_action)
+        
         invalid_action = QAction("Remove Invalid Streams", self)
         invalid_action.triggered.connect(self.remove_invalid_streams)
         tools_menu.addAction(invalid_action)
+        
+        broken_report_action = QAction("Broken Link Reporter...", self)
+        broken_report_action.triggered.connect(self.generate_broken_report)
+        tools_menu.addAction(broken_report_action)
         
         chno_action = QAction("Channel Numbering Wizard...", self)
         chno_action.triggered.connect(self.open_channel_numbering)
@@ -2147,6 +3222,10 @@ class M3UEditorWindow(QMainWindow):
         repair_action = QAction("Auto-Repair Broken Streams", self)
         repair_action.triggered.connect(self.auto_repair_streams)
         tools_menu.addAction(repair_action)
+        
+        split_action = QAction("Split Playlist by Group...", self)
+        split_action.triggered.connect(self.split_playlist)
+        tools_menu.addAction(split_action)
         
         res_action = QAction("Check Resolutions", self)
         res_action.triggered.connect(self.check_resolutions)
@@ -2176,6 +3255,30 @@ class M3UEditorWindow(QMainWindow):
         scrape_action.triggered.connect(self.scrape_logos)
         tools_menu.addAction(scrape_action)
         
+        logo_wiz_action = QAction("Channel Logo Wizard...", self)
+        logo_wiz_action.triggered.connect(self.open_logo_wizard)
+        tools_menu.addAction(logo_wiz_action)
+        
+        transcode_action = QAction("Transcode Wizard...", self)
+        transcode_action.triggered.connect(self.open_transcode_wizard)
+        tools_menu.addAction(transcode_action)
+        
+        record_action = QAction("Schedule Recording...", self)
+        record_action.triggered.connect(self.open_scheduled_recording)
+        tools_menu.addAction(record_action)
+        
+        scanner_action = QAction("Network Stream Scanner...", self)
+        scanner_action.triggered.connect(self.open_network_scanner)
+        tools_menu.addAction(scanner_action)
+        
+        cast_mgr_action = QAction("Cast Manager...", self)
+        cast_mgr_action.triggered.connect(self.open_cast_manager)
+        tools_menu.addAction(cast_mgr_action)
+        
+        speed_action = QAction("Network Speed Test", self)
+        speed_action.triggered.connect(self.open_speed_test)
+        tools_menu.addAction(speed_action)
+        
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
         tools_menu.addAction(settings_action)
@@ -2190,6 +3293,11 @@ class M3UEditorWindow(QMainWindow):
         view_mode_action.setShortcut("Ctrl+G")
         view_mode_action.triggered.connect(self.toggle_view_mode)
         view_menu.addAction(view_mode_action)
+        
+        iptv_action = QAction("IPTV Player Mode", self)
+        iptv_action.setShortcut("F11")
+        iptv_action.triggered.connect(self.open_iptv_player)
+        view_menu.addAction(iptv_action)
 
     # -------------------------------------------------------------------------
     # Actions
@@ -2200,6 +3308,41 @@ class M3UEditorWindow(QMainWindow):
         timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
         logging.info(f"Action: {message}")
         self.history_log.append(f"[{timestamp}] {message}")
+
+    def new_file(self):
+        if self.close_file():
+            self.log_action("Created new file")
+            self.status_label.setText("New file created")
+
+    def close_file(self):
+        if self.is_modified:
+            reply = QMessageBox.question(self, "Unsaved Changes", 
+                                         "You have unsaved changes. Save before closing?",
+                                         QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
+            if reply == QMessageBox.StandardButton.Save:
+                if self.current_file_path:
+                    self.quick_save()
+                else:
+                    self.save_m3u()
+                
+                if self.is_modified: # Save cancelled or failed
+                    return False
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return False
+        
+        self.undo_stack.clear()
+        self.entries = []
+        self.model.entries = self.entries
+        self.current_file_path = None
+        self.current_url = None
+        self.epg_url = ""
+        self.set_modified(False)
+        self.refresh_table()
+        self.update_group_combo()
+        self.clear_editor()
+        self.status_label.setText("Ready")
+        self.log_action("Closed file")
+        return True
 
     def stop_background_tasks(self):
         """Stops all pending background tasks."""
@@ -2296,34 +3439,79 @@ class M3UEditorWindow(QMainWindow):
             self.status_label.setText("Nothing to redo.")
 
     def load_m3u(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Open M3U File", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
-        if file_name:
-            logging.info(f"Attempting to load M3U file: {file_name}")
-            try:
+        file_names, _ = QFileDialog.getOpenFileNames(self, "Open M3U File(s)", "", "M3U Files (*.m3u *.m3u8);;All Files (*)")
+        if not file_names:
+            return
+
+        strategy = "replace"
+        if self.entries:
+            dlg = MergeStrategyDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                strategy = dlg.get_strategy()
+            else:
+                return # Cancelled
+
+        logging.info(f"Loading M3U files: {file_names} with strategy {strategy}")
+        try:
+            if strategy == "replace":
                 self.undo_stack.clear()
-                self.entries = M3UParser.parse_file(file_name)
+                self.entries = []
+                self.epg_url = ""
+                self.current_file_path = None
+            else:
+                self.save_undo_state()
+            
+            new_entries_list = []
+            
+            for file_name in file_names:
+                parsed = M3UParser.parse_file(file_name)
+                new_entries_list.extend(parsed)
                 
-                # Try to extract EPG URL from header
-                with open(file_name, 'r', encoding='utf-8', errors='ignore') as f:
-                    self.epg_url = M3UParser.extract_header_info(f.readlines()[:5]).get('url-tvg', "")
-                    head = []
-                    for _ in range(5):
-                        try: head.append(next(f))
-                        except StopIteration: break
-                    self.epg_url = M3UParser.extract_header_info(head).get('url-tvg', "")
+                # Try to extract EPG URL from header if not already found (and replacing or empty)
+                if not self.epg_url:
+                    try:
+                        with open(file_name, 'r', encoding='utf-8', errors='ignore') as f:
+                            head = [f.readline() for _ in range(5)]
+                            self.epg_url = M3UParser.extract_header_info(head).get('url-tvg', "")
+                    except Exception:
+                        pass
                 
-                self.model.entries = self.entries # Update model reference
-                self.current_file_path = file_name
-                self.current_url = None
-                self.set_modified(False)
                 self.add_recent_file(file_name)
-                self.refresh_table()
-                self.update_group_combo()
-                self.status_label.setText(f"Loaded {len(self.entries)} channels from {file_name}")
-                self.log_action(f"Loaded file: {os.path.basename(file_name)}")
-            except Exception as e:
-                logging.error(f"Failed to load M3U file: {e}", exc_info=True)
-                QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
+            
+            if strategy == "dedupe":
+                existing_urls = set(e.url for e in self.entries)
+                unique_new = []
+                for e in new_entries_list:
+                    if e.url not in existing_urls:
+                        unique_new.append(e)
+                        existing_urls.add(e.url)
+                self.entries.extend(unique_new)
+                added_count = len(unique_new)
+            else:
+                self.entries.extend(new_entries_list)
+                added_count = len(new_entries_list)
+            
+            self.model.entries = self.entries
+            
+            if strategy == "replace" and len(file_names) == 1:
+                self.current_file_path = file_names[0]
+                self.set_modified(False)
+                self.status_label.setText(f"Loaded {len(self.entries)} channels from {os.path.basename(self.current_file_path)}")
+            else:
+                if strategy == "replace":
+                    self.current_file_path = None
+                self.set_modified(True)
+                self.status_label.setText(f"Loaded/Added {added_count} channels.")
+                self.setWindowTitle("Open Source M3U Editor - Combined Playlist *")
+                self.log_action(f"Loaded {len(file_names)} files (Strategy: {strategy})")
+
+            self.current_url = None
+            self.refresh_table()
+            self.update_group_combo()
+            
+        except Exception as e:
+            logging.error(f"Failed to load M3U files: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Could not load files: {str(e)}")
 
     def add_recent_file(self, path):
         if path in self.recent_files:
@@ -2507,6 +3695,43 @@ class M3UEditorWindow(QMainWindow):
                 self.log_action(f"Merged {len(new_entries)} channels from {os.path.basename(file_name)}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not merge file: {str(e)}")
+
+    def split_playlist(self):
+        if not self.entries:
+            QMessageBox.warning(self, "Warning", "No entries to split.")
+            return
+            
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if not dir_path:
+            return
+            
+        self.create_backup("before_split")
+        
+        # Group entries
+        groups = {}
+        for entry in self.entries:
+            g = entry.group if entry.group else "Uncategorized"
+            if g not in groups:
+                groups[g] = []
+            groups[g].append(entry)
+            
+        count = 0
+        try:
+            for group_name, entries in groups.items():
+                # Sanitize filename
+                safe_name = "".join([c for c in group_name if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).strip()
+                if not safe_name:
+                    safe_name = "unknown_group"
+                
+                filename = os.path.join(dir_path, f"{safe_name}.m3u")
+                M3UParser.save_file(filename, entries)
+                count += 1
+                
+            QMessageBox.information(self, "Success", f"Playlist split into {count} files.")
+            self.log_action(f"Split playlist into {count} files in {dir_path}")
+        except Exception as e:
+            logging.error(f"Split playlist failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to split playlist: {str(e)}")
 
     def save_m3u(self):
         if not self.entries:
@@ -3549,6 +4774,47 @@ class M3UEditorWindow(QMainWindow):
             self.log_action("Logo scraping completed")
             QMessageBox.information(self, "Success", "Logo scraping complete.")
 
+    def open_logo_wizard(self):
+        """Opens a wizard to match logos from a repository."""
+        # Identify channels without logos
+        rows_to_check = []
+        for row, entry in enumerate(self.entries):
+            if not entry.logo:
+                rows_to_check.append((row, entry.name))
+        
+        if not rows_to_check:
+            QMessageBox.information(self, "Info", "All channels already have logos.")
+            return
+
+        base_url, ok = QInputDialog.getText(self, "Channel Logo Wizard", 
+                                            f"Found {len(rows_to_check)} channels without logos.\n"
+                                            "Enter base repository URL (must end with /):\n"
+                                            "The wizard will try to match 'Name' -> 'base_url/name.png'",
+                                            text="https://raw.githubusercontent.com/tv-logo/tv-logos/main/countries/us/")
+        if ok and base_url:
+            if not base_url.endswith('/'): base_url += '/'
+            
+            self.create_backup("logo_wizard")
+            self.save_undo_state()
+            
+            self.btn_stop.setEnabled(True)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.status_label.setText(f"Matching logos for {len(rows_to_check)} channels...")
+            
+            worker = LogoWizardWorker(rows_to_check, base_url)
+            worker.signals.found.connect(self.on_scrape_result) # Reuse scrape result handler
+            worker.signals.progress.connect(self.progress_bar.setValue)
+            worker.signals.finished.connect(lambda count: self.on_logo_wizard_finished(count))
+            self.thread_pool.start(worker)
+
+    def on_logo_wizard_finished(self, count):
+        self.progress_bar.setVisible(False)
+        self.btn_stop.setEnabled(False)
+        self.status_label.setText(f"Logo Wizard complete. Matched {count} logos.")
+        self.log_action(f"Logo Wizard matched {count} logos")
+        QMessageBox.information(self, "Success", f"Wizard complete.\nMatched and updated {count} logos.")
+
     def fetch_logo(self, url):
         # logging.debug(f"Fetching logo: {url}") # Can be verbose
         worker = LogoWorker(url)
@@ -3570,45 +4836,171 @@ class M3UEditorWindow(QMainWindow):
                         idx = self.model.index(row, 1)
                         self.model.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
+    def add_recent_stream(self, entry):
+        # Check if exists and remove to move to top
+        items = self.recent_list.findItems(entry.name, Qt.MatchFlag.MatchExactly)
+        for item in items:
+            if item.data(Qt.ItemDataRole.UserRole) == entry.url:
+                self.recent_list.takeItem(self.recent_list.row(item))
+                break
+        
+        item = QListWidgetItem(entry.name)
+        item.setData(Qt.ItemDataRole.UserRole, entry.url)
+        item.setToolTip(entry.url)
+        self.recent_list.insertItem(0, item)
+        
+        # Limit to 20 items
+        while self.recent_list.count() > 20:
+            self.recent_list.takeItem(self.recent_list.count() - 1)
+            
+    def on_recent_item_double_clicked(self, item):
+        url = item.data(Qt.ItemDataRole.UserRole)
+        # Find entry in current list
+        for i, e in enumerate(self.entries):
+            if e.url == url:
+                # Select in table
+                source_index = self.model.index(i, 0)
+                proxy_index = self.proxy_model.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    self.table.selectRow(proxy_index.row())
+                self.open_stream_preview()
+                return
+        
+        QMessageBox.information(self, "Info", "Stream not found in current playlist.")
+
     def find_duplicates(self):
         seen_urls = set()
-        duplicate_rows = []
+        duplicate_indices = []
         
         self.model.highlight_data.clear()
 
         for i, entry in enumerate(self.entries):
             if entry.url in seen_urls:
-                duplicate_rows.append(i)
+                duplicate_indices.append(i)
             else:
                 seen_urls.add(entry.url)
 
-        if not duplicate_rows:
+        if not duplicate_indices:
             QMessageBox.information(self, "Duplicates", "No duplicate URLs found.")
             return
-
-        self.table.clearSelection()
-        for row in duplicate_rows:
-            # Highlight visually
-            entry = self.entries[row]
-            self.model.highlight_data[id(entry)] = QColor("#fff9c4")
-            # Select the row
-            source_index = self.model.index(row, 0)
-            proxy_index = self.proxy_model.mapFromSource(source_index)
-            if proxy_index.isValid():
-                self.table.selectRow(proxy_index.row())
 
         reply = QMessageBox.question(
             self, 
             "Duplicates Found", 
-            f"Found {len(duplicate_rows)} duplicates.\nDo you want to delete them now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            f"Found {len(duplicate_indices)} duplicates.\n\n"
+            "Yes: Delete them immediately (Fastest)\n"
+            "No: Highlight them in the list (Slower for many items)\n"
+            "Cancel: Do nothing",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            self.create_backup("dedupe")
-            self.delete_entry()
-        else:
-            self.model.layoutChanged.emit() # Refresh to show highlights
+            self.create_backup("dedupe_batch")
+            self.save_undo_state()
+            
+            # Batch remove using list comprehension for speed
+            dupe_set = set(duplicate_indices)
+            self.entries = [e for i, e in enumerate(self.entries) if i not in dupe_set]
+            
+            self.model.entries = self.entries
+            self.refresh_table()
+            self.set_modified(True)
+            self.log_action(f"Batch removed {len(duplicate_indices)} duplicates")
+            QMessageBox.information(self, "Success", f"Removed {len(duplicate_indices)} duplicates.")
+            
+        elif reply == QMessageBox.StandardButton.No:
+            self.table.clearSelection()
+            selection = QItemSelection()
+            for row in duplicate_indices:
+                entry = self.entries[row]
+                self.model.highlight_data[id(entry)] = QColor("#fff9c4")
+                
+                # Mapping to proxy is expensive if filter is active, but necessary for selection
+                source_index = self.model.index(row, 0)
+                proxy_index = self.proxy_model.mapFromSource(source_index)
+                if proxy_index.isValid():
+                    selection.select(proxy_index, proxy_index)
+            
+            self.table.selectionModel().select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            self.model.layoutChanged.emit() # Refresh highlights
+
+    def smart_dedupe(self):
+        if not self.entries:
+            QMessageBox.warning(self, "Warning", "No entries to process.")
+            return
+            
+        dlg = SmartDedupeDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        mode, ignore_case = dlg.get_options()
+        
+        self.create_backup("smart_dedupe")
+        self.save_undo_state()
+        
+        # Helper to calculate score
+        def get_score(entry):
+            score = 0
+            # Metadata score
+            if entry.logo: score += 10
+            if entry.tvg_id: score += 10
+            if entry.group and entry.group != "Uncategorized": score += 5
+            if entry.tvg_chno: score += 5
+            
+            # Resolution score (only relevant for Name mode, but harmless for URL)
+            name_upper = entry.name.upper()
+            if "4K" in name_upper or "UHD" in name_upper: score += 100
+            elif "1080" in name_upper or "FHD" in name_upper: score += 80
+            elif "720" in name_upper or "HD" in name_upper: score += 60
+            elif "SD" in name_upper or "480" in name_upper: score += 40
+            
+            return score
+
+        groups = {}
+        for i, entry in enumerate(self.entries):
+            key = entry.name if mode == "name" else entry.url
+            if ignore_case:
+                key = key.lower()
+            
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((i, entry))
+            
+        indices_to_remove = []
+        kept_count = 0
+        removed_count = 0
+        
+        for key, items in groups.items():
+            if len(items) > 1:
+                # Sort by score descending
+                items.sort(key=lambda x: get_score(x[1]), reverse=True)
+                
+                # Keep the first one (highest score)
+                # Mark others for removal
+                for i in range(1, len(items)):
+                    indices_to_remove.append(items[i][0])
+                removed_count += len(items) - 1
+            kept_count += 1
+            
+        if not indices_to_remove:
+            QMessageBox.information(self, "Smart Dedupe", "No duplicates found based on criteria.")
+            return
+            
+        # Remove in reverse order
+        indices_to_remove.sort(reverse=True)
+        self.model.beginResetModel()
+        for idx in indices_to_remove:
+            del self.entries[idx]
+        self.model.rebuild_logo_map()
+        self.model.endResetModel()
+        
+        self.set_modified(True)
+        self.refresh_table()
+        self.update_group_combo()
+        
+        msg = f"Smart Dedupe complete.\nRemoved {removed_count} duplicates.\nKept {kept_count} unique entries."
+        QMessageBox.information(self, "Success", msg)
+        self.log_action(f"Smart Dedupe removed {removed_count} entries")
 
     def play_stream(self):
         selected_rows = self.table.selectionModel().selectedRows()
@@ -3616,6 +5008,7 @@ class M3UEditorWindow(QMainWindow):
             proxy_index = selected_rows[0]
             source_index = self.proxy_model.mapToSource(proxy_index)
             entry = self.entries[source_index.row()]
+            self.add_recent_stream(entry)
             self.player.setSource(QUrl(entry.url))
             self.player.play()
 
@@ -3645,6 +5038,36 @@ class M3UEditorWindow(QMainWindow):
                 del self.entries[row]
             self.model.endResetModel()
             QMessageBox.information(self, "Success", "Invalid streams removed.")
+
+    def generate_broken_report(self):
+        """Generates a text file report of all invalid streams."""
+        broken_entries = []
+        for row, entry in enumerate(self.entries):
+            val_data = self.model.validation_data.get(id(entry))
+            # Check validation data or health_status string
+            is_valid = val_data[2] if val_data else None
+            msg = val_data[1] if val_data else entry.health_status
+            
+            if is_valid is False or (is_valid is None and entry.health_status and "error" in entry.health_status.lower()):
+                broken_entries.append((entry, msg))
+        
+        if not broken_entries:
+            QMessageBox.information(self, "Report", "No broken links found (run validation first).")
+            return
+            
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Report", "broken_links_report.txt", "Text Files (*.txt)")
+        if file_name:
+            try:
+                with open(file_name, 'w', encoding='utf-8') as f:
+                    f.write(f"Broken Link Report - {QDateTime.currentDateTime().toString()}\n")
+                    f.write(f"Total Broken Streams: {len(broken_entries)}\n")
+                    f.write("-" * 50 + "\n\n")
+                    for entry, msg in broken_entries:
+                        f.write(f"Name: {entry.name}\nGroup: {entry.group}\nURL: {entry.url}\nError: {msg}\n\n")
+                QMessageBox.information(self, "Success", f"Report saved to {file_name}")
+                self.log_action("Generated broken link report")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save report: {e}")
 
     def toggle_theme(self, initial=False):
         app = QApplication.instance()
@@ -3786,6 +5209,116 @@ class M3UEditorWindow(QMainWindow):
 
     def open_statistics(self):
         dlg = StatisticsDialog(self, self.entries, self.model.validation_data)
+        dlg.exec()
+
+    def open_iptv_player(self):
+        if not self.entries:
+            QMessageBox.warning(self, "Error", "No playlist loaded.")
+            return
+            
+        idx = 0
+        selected = self.get_selected_rows()
+        if selected:
+            idx = self.proxy_model.mapToSource(selected[0]).row()
+            
+        self.iptv_window = IPTVPlayerWindow(self.entries, idx, self)
+        self.iptv_window.show()
+
+    def open_speed_test(self):
+        dlg = SpeedTestDialog(self)
+        dlg.exec()
+
+    def open_transcode_wizard(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select channels to transcode.")
+            return
+            
+        dlg = TranscodeDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            fmt_idx, preset, output_dir = dlg.get_settings()
+            if not output_dir:
+                QMessageBox.warning(self, "Warning", "No output directory selected.")
+                return
+                
+            self.status_label.setText(f"Starting transcoding for {len(selected_rows)} streams...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.btn_stop.setEnabled(True)
+            
+            for idx in selected_rows:
+                source_index = self.proxy_model.mapToSource(idx)
+                entry = self.entries[source_index.row()]
+                
+                # Sanitize filename
+                safe_name = "".join([c for c in entry.name if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).strip()
+                if not safe_name: safe_name = "stream"
+                
+                ext = ".mp4" if fmt_idx == 0 else (".mkv" if fmt_idx == 1 else ".ts")
+                output_path = os.path.join(output_dir, f"{safe_name}{ext}")
+                
+                cmd = ["ffmpeg", "-y", "-i", entry.url]
+                if fmt_idx == 0: # MP4
+                    cmd.extend(["-c:v", "libx264", "-preset", preset, "-c:a", "aac"])
+                else: # Copy
+                    cmd.extend(["-c", "copy"])
+                cmd.append(output_path)
+                
+                worker = FFmpegWorker(cmd)
+                worker.signals.finished.connect(lambda: self.status_label.setText(f"Finished: {safe_name}"))
+                worker.signals.error.connect(lambda err: self.log_action(f"Transcode Error: {err}"))
+                self.thread_pool.start(worker)
+                
+            self.log_action(f"Started transcoding {len(selected_rows)} streams")
+
+    def open_scheduled_recording(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select a channel to record.")
+            return
+            
+        # Only one for now
+        source_index = self.proxy_model.mapToSource(selected_rows[0])
+        entry = self.entries[source_index.row()]
+        
+        dlg = ScheduledRecordingDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            start_dt, duration_min, output_file = dlg.get_settings()
+            if not output_file:
+                return
+                
+            now = QDateTime.currentDateTime()
+            delay_ms = now.msecsTo(start_dt)
+            
+            if delay_ms < 0:
+                delay_ms = 0 # Start immediately if in past
+                
+            cmd = ["ffmpeg", "-y", "-i", entry.url, "-t", str(duration_min * 60), "-c", "copy", output_file]
+            
+            def start_record():
+                self.status_label.setText(f"Recording started: {entry.name}")
+                worker = FFmpegWorker(cmd)
+                worker.signals.finished.connect(lambda: QMessageBox.information(self, "Recording", f"Recording finished: {entry.name}"))
+                self.thread_pool.start(worker)
+                
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(start_record)
+            timer.start(delay_ms)
+            self.scheduled_timers.append(timer) # Keep reference
+            
+            self.log_action(f"Scheduled recording for {entry.name} at {start_dt.toString()}")
+            QMessageBox.information(self, "Scheduled", f"Recording scheduled for {start_dt.toString()}")
+
+    def open_network_scanner(self):
+        dlg = NetworkScannerDialog(self)
+        worker = NetworkScannerWorker()
+        worker.signals.found.connect(dlg.add_device)
+        self.thread_pool.start(worker)
+        dlg.exec()
+
+    def open_cast_manager(self):
+        dlg = CastManagerDialog(self)
         dlg.exec()
 
 # -----------------------------------------------------------------------------

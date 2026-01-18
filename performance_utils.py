@@ -33,13 +33,22 @@ class LogoWorker(QRunnable):
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = response.read()
                 if not self._is_cancelled:
-                    self.signals.result.emit(self.url, data)
+                    try:
+                        self.signals.result.emit(self.url, data)
+                    except RuntimeError:
+                        pass # Signal object deleted
         except urllib.error.HTTPError as e:
             if not self._is_cancelled:
-                self.signals.error.emit(self.url, f"HTTP {e.code}")
+                try:
+                    self.signals.error.emit(self.url, f"HTTP {e.code}")
+                except RuntimeError:
+                    pass
         except Exception as e:
             if not self._is_cancelled:
-                self.signals.error.emit(self.url, str(e))
+                try:
+                    self.signals.error.emit(self.url, str(e))
+                except RuntimeError:
+                    pass
 
 class ThrottledLogoLoader(QObject):
     """Manages logo downloads with rate limiting and prioritization."""

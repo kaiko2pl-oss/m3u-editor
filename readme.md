@@ -16,6 +16,11 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
     *   **Navigation**: Browse through channels directly within the preview window using Next/Previous buttons.
     *   **Integrated Storyboard**: Generate and view frame-by-frame storyboards of your streams.
     *   **Live Editing**: Edit the channel's group directly from the preview screen with real-time synchronization.
+    *   **Playback Control**: Adjust playback speed (0.5x - 2.0x) and aspect ratio (Fit, Stretch, Zoom).
+    *   **Track Selection**: Switch between available Audio and Subtitle tracks.
+    *   **Snapshot**: Capture high-quality screenshots of the current stream.
+    *   **Always on Top**: Toggle to keep the preview window above other applications.
+    *   **Quick Actions**: Copy stream URL to clipboard directly from the preview.
 *   **Stream Security Audit**:
     *   **Comprehensive Scanning**: Audit streams for SSL/TLS validity, content-type correctness, and suspicious redirects.
     *   **Reputation Check**: Identify streams from known malicious or low-reputation domains.
@@ -27,6 +32,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
     *   **Context Menu**: Quick "Edit Group" and "Open in VLC" actions.
     *   **Country Flags**: Auto-detect country from channel names and append flags to group titles.
 *   **Health Check**: Validate stream URLs via asynchronous HTTP HEAD requests with granular feedback.
+*   **Recent Streams**: Quickly access previously previewed channels from the "Recent" tab.
 *   **Favorites System**: Pin channels to a dedicated view using the "Favorites" toggle.
 *   **Search & Filter**: Real-time search and group-based filtering.
 *   **Export**: Export playlists to CSV format.
@@ -38,7 +44,10 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
     *   **Latency Checker**: Measure Time-To-First-Byte (TTFB) for streams.
     *   **Logo Scraper**: Attempt to find missing logos via Google Images search.
     *   **Find Duplicates**: Identify and highlight duplicate stream URLs.
+    *   **Smart Dedupe**: Intelligent removal of duplicates based on resolution quality or metadata completeness.
     *   **Xtream Codes Support**: Load playlists and EPG directly from Xtream Codes API credentials.
+    *   **IPTV Player Mode**: A dedicated, full-screen capable interface for a lean-back viewing experience.
+    *   **Picture-in-Picture**: Keep the IPTV player visible in a small floating window while multitasking.
 
 ## Demo
 
@@ -51,6 +60,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   PyQt6
 *   VLC (Optional, for external playback)
 *   FFmpeg/ffprobe (Optional, for Resolution Checker)
+*   pychromecast (Optional, for Casting support)
 
 ## Installation
 
@@ -59,6 +69,7 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 
 ```bash
 pip install PyQt6
+pip install pychromecast
 ```
 
 *Note: Depending on your OS, you might need additional codecs for the video preview to work with all stream types.*
@@ -77,6 +88,7 @@ pip install PyQt6
 5.  **Smart Grouping**: Use the **Smart Grouping** feature to automatically categorize channels based on their names.
 6.  **Manage Groups**: Use the **Manage Groups** button to perform bulk group operations.
 7.  **Save**: Click the **Save** button (enabled when changes are made to local files) to persist your work. Modified files are marked with an asterisk (*) in the title bar.
+8.  **Settings**: Configure VLC path and clear local EPG cache via the **Tools > Settings** menu.
 
 
 ## Security & Privacy
@@ -88,9 +100,10 @@ This application prioritizes your security:
 
 ## Roadmap
 
-*   **EPG (Electronic Program Guide) Integration**: Support for XMLTV files to display "Now Playing" information and full program schedules.
-*   **Advanced Playlist Deduplication & Merging**: A smart wizard to combine multiple playlists, intelligently detect duplicates, and manage stream sources.
-*   **Batch Rename & Find/Replace**: Advanced regex-based tools for bulk channel name and metadata editing.
+*   **Cloud Sync**: Integration with Google Drive/Dropbox for syncing playlists across devices.
+*   **Scheduled Recording**: Ability to schedule stream recordings based on EPG data.
+*   **Transcoding Support**: Convert streams to different formats using FFmpeg integration.
+*   **Advanced EPG**: Support for multiple EPG sources per playlist and manual channel mapping.
 
 ## License
 
