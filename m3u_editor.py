@@ -322,10 +322,11 @@ class EPGSignals(QObject):
 
 class EPGWorker(QRunnable):
     """Worker to fetch and parse XMLTV data (XML, GZ, XZ) from multiple sources."""
-    def __init__(self, urls, cache_dir="epg_cache", cache_ttl=86400):
+    def __init__(self, urls, cache_dir="epg_cache", cache_ttl=86400, base_path=None):
         super().__init__()
         self.urls = urls if isinstance(urls, list) else [urls]
-        self.cache_dir = os.path.join(os.getcwd(), cache_dir)
+        self.base_path = base_path or get_base_path()
+        self.cache_dir = os.path.join(self.base_path, cache_dir)
         self.cache_ttl = cache_ttl
         self.signals = EPGSignals()
 
@@ -966,7 +967,7 @@ class SettingsDialog(QDialog):
         return self.path_edit.text()
 
     def clear_cache(self):
-        cache_dir = os.path.join(os.getcwd(), "epg_cache")
+        cache_dir = os.path.join(get_base_path(), "epg_cache")
         if os.path.exists(cache_dir):
             try:
                 shutil.rmtree(cache_dir)
@@ -1676,7 +1677,7 @@ class SnapshotGalleryDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Snapshot Gallery")
         self.resize(800, 600)
-        self.snapshot_dir = os.path.join(os.getcwd(), "snapshots")
+        self.snapshot_dir = os.path.join(get_base_path(), "snapshots")
         os.makedirs(self.snapshot_dir, exist_ok=True)
         
         layout = QVBoxLayout(self)
@@ -3432,7 +3433,7 @@ class IPTVPlayerWindow(QMainWindow):
     def take_snapshot(self):
         pixmap = self.video_widget.grab()
         if not pixmap.isNull():
-            snapshot_dir = os.path.join(os.getcwd(), "snapshots")
+            snapshot_dir = os.path.join(get_base_path(), "snapshots")
             os.makedirs(snapshot_dir, exist_ok=True)
             filename = f"snapshot_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.png"
             filepath = os.path.join(snapshot_dir, filename)
@@ -4157,7 +4158,7 @@ class LanguageManagerDialog(QDialog):
 
 class PluginManager:
     def __init__(self, plugin_dir="plugins"):
-        self.plugin_dir = os.path.join(os.getcwd(), plugin_dir)
+        self.plugin_dir = os.path.join(get_base_path(), plugin_dir)
         self.plugins = [] # List of dicts
 
     def discover_plugins(self):
@@ -4207,6 +4208,15 @@ DEFAULT_THEME = {
     'button_pressed': '#585b70',
     'input': '#181825'
 }
+
+def get_base_path():
+    """Returns the base path of the application, handling frozen (packaged) state."""
+    if getattr(sys, 'frozen', False):
+        # If the application is run as a bundle, the PyInstaller bootloader
+        # extends the sys module by a flag frozen=True and sets the app 
+        # path into variable _MEIPASS'.
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 # Language keywords for detection
 LANGUAGE_PATTERNS = {
@@ -5138,7 +5148,7 @@ class M3UEditorWindow(QMainWindow):
         """Creates a zip backup of the current playlist."""
         if not self.entries: return
         
-        backup_dir = os.path.join(os.getcwd(), "backups")
+        backup_dir = os.path.join(get_base_path(), "backups")
         os.makedirs(backup_dir, exist_ok=True)
         
         timestamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
@@ -5154,7 +5164,7 @@ class M3UEditorWindow(QMainWindow):
             self.log_action(f"Backup failed: {str(e)}")
 
     def restore_backup(self):
-        backup_dir = os.path.join(os.getcwd(), "backups")
+        backup_dir = os.path.join(get_base_path(), "backups")
         if not os.path.exists(backup_dir):
             QMessageBox.information(self, "Restore", "No backups found.")
             return
@@ -5797,7 +5807,7 @@ class M3UEditorWindow(QMainWindow):
         self.progress_bar.setRange(0, 0) # Indeterminate
         self.btn_epg.setEnabled(False)
         
-        worker = EPGWorker(self.epg_urls)
+        worker = EPGWorker(self.epg_urls, base_path=get_base_path())
         worker.signals.finished.connect(lambda data, count: self.on_epg_loaded(data, count, silent))
         worker.signals.error.connect(lambda err: self.status_label.setText(f"EPG Error: {err}"))
         worker.signals.progress.connect(self.status_label.setText)
@@ -6364,7 +6374,7 @@ class M3UEditorWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0) # Indeterminate
         
-        worker = EPGWorker(url)
+        worker = EPGWorker(url, base_path=get_base_path())
         worker.signals.finished.connect(self.on_epg_loaded)
         worker.signals.error.connect(lambda err: QMessageBox.critical(self, "Error", f"EPG Error: {err}"))
         self.thread_pool.start(worker)

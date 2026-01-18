@@ -84,6 +84,27 @@ A robust, cross-platform GUI application built with Python and PyQt6 for managin
 *   **qrcode**: Required for Mobile Casting (QR Code generation).
 *   **deep-translator**: Required for Quick Translate feature.
 
+## Build & Deployment
+
+### Desktop (Windows & macOS)
+To create a standalone executable/application for your operating system:
+
+1.  Install the build requirements:
+    ```bash
+    pip install -r requirements.txt
+    ```
+2.  Run the build script:
+    ```bash
+    python build_app.py
+    ```
+3.  Find your application in the `dist/` folder.
+
+### Android & Google TV
+While this application is built with Python and Qt (which supports Android), porting it to a mobile/TV interface requires additional steps:
+1.  **Tooling**: Use **BeeWare (Briefcase)** or **PyQt-Deploy**.
+2.  **UI Adaptation**: The current interface is optimized for mouse/keyboard. For TV usage, the UI would need to be adapted for D-Pad navigation.
+3.  **Build**: Once adapted, you can generate an APK using `briefcase build android`.
+
 ## Installation
 
 1.  Clone the repository or download the source code.
