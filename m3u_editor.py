@@ -27,6 +27,7 @@ import http.cookiejar
 import importlib.util
 import warnings
 import io
+import webbrowser
 
 try:
     import pychromecast
@@ -474,17 +475,18 @@ class ResolutionSignals(QObject):
 
 class ResolutionWorker(QRunnable):
     """Worker to detect stream resolution using ffprobe."""
-    def __init__(self, row_index, url):
+    def __init__(self, row_index, url, ffprobe_path="ffprobe"):
         super().__init__()
         self.row_index = row_index
         self.url = url
+        self.ffprobe_path = ffprobe_path
         self.signals = ResolutionSignals()
 
     def run(self):
         try:
-            if not shutil.which("ffprobe"):
-                self.signals.result.emit(self.row_index, "No ffprobe")
-                return
+            if self.ffprobe_path == "ffprobe" and not shutil.which("ffprobe"):
+                 self.signals.result.emit(self.row_index, "No ffprobe")
+                 return
 
             res = self.get_resolution(self.url)
             if res:
@@ -497,8 +499,7 @@ class ResolutionWorker(QRunnable):
     def get_resolution(self, url):
         try:
             # Requires ffprobe in PATH
-            cmd = [
-                "ffprobe", "-v", "error", 
+            cmd = [self.ffprobe_path, "-v", "error", 
                 "-select_streams", "v:0", 
                 "-show_entries", "stream=width,height", 
                 "-of", "csv=s=x:p=0", 
@@ -930,11 +931,12 @@ class PlaylistTable(QTableView):
             super().dropEvent(event)
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, current_path=""):
+    def __init__(self, parent=None, current_path="", current_ffmpeg_dir=""):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(400, 150)
+        self.resize(450, 200)
         self.vlc_path = current_path
+        self.ffmpeg_dir = current_ffmpeg_dir
         
         layout = QVBoxLayout(self)
         
@@ -948,6 +950,14 @@ class SettingsDialog(QDialog):
         row_layout.addWidget(btn_browse)
         
         form.addRow("VLC Path:", row_layout)
+        
+        self.ffmpeg_edit = QLineEdit(self.ffmpeg_dir)
+        btn_browse_ffmpeg = QPushButton("Browse")
+        btn_browse_ffmpeg.clicked.connect(self.browse_ffmpeg)
+        row_ffmpeg = QHBoxLayout()
+        row_ffmpeg.addWidget(self.ffmpeg_edit)
+        row_ffmpeg.addWidget(btn_browse_ffmpeg)
+        form.addRow("FFmpeg Dir:", row_ffmpeg)
         layout.addLayout(form)
         
         # Cache section
@@ -967,9 +977,17 @@ class SettingsDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "Select VLC Executable")
         if path:
             self.path_edit.setText(path)
+
+    def browse_ffmpeg(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory containing FFmpeg/FFprobe")
+        if path:
+            self.ffmpeg_edit.setText(path)
             
     def get_path(self):
         return self.path_edit.text()
+    
+    def get_ffmpeg_dir(self):
+        return self.ffmpeg_edit.text()
 
     def clear_cache(self):
         cache_dir = os.path.join(get_base_path(), "epg_cache")
@@ -3421,6 +3439,7 @@ class IPTVPlayerWindow(QMainWindow):
         self.setWindowTitle("IPTV Player Mode")
         self.resize(1280, 720)
         self.setStyleSheet("background-color: black;")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         
         # Player Setup
         self.player = QMediaPlayer()
@@ -3896,21 +3915,21 @@ class DiagnosticsSignals(QObject):
 
 class DiagnosticsWorker(QRunnable):
     """Worker to run ffprobe and get stream details."""
-    def __init__(self, url):
+    def __init__(self, url, ffprobe_path="ffprobe"):
         super().__init__()
         self.url = url
+        self.ffprobe_path = ffprobe_path
         self.signals = DiagnosticsSignals()
 
     def run(self):
         try:
-            if not shutil.which("ffprobe"):
-                self.signals.error.emit("ffprobe not found. Please install FFmpeg and add to PATH.")
-                self.signals.finished.emit()
-                return
+            if self.ffprobe_path == "ffprobe" and not shutil.which("ffprobe"):
+                 self.signals.error.emit("ffprobe not found. Please install FFmpeg or configure path in Settings.")
+                 self.signals.finished.emit()
+                 return
 
             # Run ffprobe to get JSON output
-            cmd = [
-                "ffprobe", "-v", "quiet", 
+            cmd = [self.ffprobe_path, "-v", "quiet", 
                 "-print_format", "json", 
                 "-show_format", "-show_streams", 
                 self.url
@@ -3996,6 +4015,102 @@ class StreamDiagnosticsDialog(QDialog):
     def show_error(self, err):
         self.status_lbl.setText(f"Error: {err}")
 
+class BitrateAnalyzerSignals(QObject):
+    result = pyqtSignal(str, str, str) # video_bitrate, audio_bitrate, log
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+class BitrateAnalyzerWorker(QRunnable):
+    """Worker to sample stream and calculate average bitrate using ffmpeg."""
+    def __init__(self, url, duration, ffmpeg_path="ffmpeg"):
+        super().__init__()
+        self.url = url
+        self.duration = duration
+        self.ffmpeg_path = ffmpeg_path
+        self.signals = BitrateAnalyzerSignals()
+
+    def run(self):
+        if self.ffmpeg_path == "ffmpeg" and not shutil.which("ffmpeg"):
+             self.signals.error.emit("ffmpeg not found. Please install FFmpeg or configure path in Settings.")
+             self.signals.finished.emit()
+             return
+
+        try:
+            # Run ffmpeg to read stream for 'duration' seconds and map video/audio to null output
+            # -c copy ensures we measure the stream as-is without transcoding overhead
+            cmd = [
+                self.ffmpeg_path, "-hide_banner", "-y",
+                "-i", self.url,
+                "-t", str(self.duration),
+                "-map", "0:v:0?", "-map", "0:a:0?", # Map first video and audio if present
+                "-c", "copy",
+                "-f", "null", "-"
+            ]
+            
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                creationflags=creationflags,
+                timeout=self.duration + 10
+            )
+            
+            output = process.stderr
+            
+            # Parse output for "video:SIZE audio:SIZE" stats line
+            # Example: video:1234kB audio:120kB ...
+            vid_bitrate = "N/A"
+            aud_bitrate = "N/A"
+            
+            match = re.search(r"video:\s*([0-9.]+[kMG]?B)\s+audio:\s*([0-9.]+[kMG]?B)", output)
+            if match:
+                vid_size = self.parse_size_bits(match.group(1))
+                aud_size = self.parse_size_bits(match.group(2))
+                
+                if self.duration > 0:
+                    vid_bps = vid_size / self.duration
+                    aud_bps = aud_size / self.duration
+                    vid_bitrate = self.format_bitrate(vid_bps)
+                    aud_bitrate = self.format_bitrate(aud_bps)
+            
+            self.signals.result.emit(vid_bitrate, aud_bitrate, output)
+            
+        except Exception as e:
+            self.signals.error.emit(str(e))
+        finally:
+            self.signals.finished.emit()
+
+    def parse_size_bits(self, size_str):
+        """Converts size string (e.g. 123kB) to bits."""
+        size_str = size_str.strip()
+        multiplier = 8 # Base bits
+        if size_str.endswith("kB"):
+            multiplier *= 1024
+            val = float(size_str[:-2])
+        elif size_str.endswith("MB"):
+            multiplier *= 1024 * 1024
+            val = float(size_str[:-2])
+        elif size_str.endswith("GB"):
+            multiplier *= 1024 * 1024 * 1024
+            val = float(size_str[:-2])
+        elif size_str.endswith("B"):
+            val = float(size_str[:-1])
+        else:
+            return 0.0
+        return val * multiplier
+
+    def format_bitrate(self, bps):
+        if bps >= 1_000_000:
+            return f"{bps/1_000_000:.2f} Mbps"
+        elif bps >= 1_000:
+            return f"{bps/1_000:.2f} Kbps"
+        else:
+            return f"{bps:.0f} bps"
+
 class TranscodeDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4035,6 +4150,78 @@ class TranscodeDialog(QDialog):
             
     def get_settings(self):
         return self.format_combo.currentIndex(), self.preset_combo.currentText(), self.output_dir
+
+class BitrateAnalyzerDialog(QDialog):
+    def __init__(self, url, parent=None, ffmpeg_path="ffmpeg"):
+        super().__init__(parent)
+        self.setWindowTitle("Stream Bitrate Analyzer")
+        self.resize(500, 400)
+        self.url = url
+        self.ffmpeg_path = ffmpeg_path
+        
+        layout = QVBoxLayout(self)
+        
+        form = QFormLayout()
+        self.spin_duration = QSpinBox()
+        self.spin_duration.setRange(3, 60)
+        self.spin_duration.setValue(5)
+        self.spin_duration.setSuffix(" sec")
+        form.addRow("Sample Duration:", self.spin_duration)
+        layout.addLayout(form)
+        
+        self.btn_start = QPushButton("Start Analysis")
+        self.btn_start.clicked.connect(self.start_analysis)
+        layout.addWidget(self.btn_start)
+        
+        res_group = QGroupBox("Average Bitrate Results")
+        res_layout = QFormLayout(res_group)
+        self.lbl_video = QLabel("-")
+        self.lbl_audio = QLabel("-")
+        res_layout.addRow("Video:", self.lbl_video)
+        res_layout.addRow("Audio:", self.lbl_audio)
+        layout.addWidget(res_group)
+        
+        layout.addWidget(QLabel("FFmpeg Log:"))
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
+        
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 0)
+        layout.addWidget(self.progress)
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+        
+    def start_analysis(self):
+        self.btn_start.setEnabled(False)
+        self.progress.setVisible(True)
+        self.lbl_video.setText("Analyzing...")
+        self.lbl_audio.setText("Analyzing...")
+        self.log_view.clear()
+        
+        duration = self.spin_duration.value()
+        worker = BitrateAnalyzerWorker(self.url, duration, self.ffmpeg_path)
+        worker.signals.result.connect(self.on_result)
+        worker.signals.error.connect(self.on_error)
+        worker.signals.finished.connect(self.on_finished)
+        QThreadPool.globalInstance().start(worker)
+        
+    def on_result(self, vid, aud, log):
+        self.lbl_video.setText(vid)
+        self.lbl_audio.setText(aud)
+        self.log_view.setText(log)
+        
+    def on_error(self, err):
+        self.lbl_video.setText("Error")
+        self.lbl_audio.setText("Error")
+        self.log_view.setText(f"Error: {err}")
+        
+    def on_finished(self):
+        self.btn_start.setEnabled(True)
+        self.progress.setVisible(False)
 
 class ScheduledRecordingDialog(QDialog):
     def __init__(self, parent=None):
@@ -4326,6 +4513,9 @@ DEFAULT_THEME = {
     'input': '#181825'
 }
 
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "kamalsoft/m3u-editor"
+
 def get_base_path():
     """Returns the base path of the application, handling frozen (packaged) state."""
     if getattr(sys, 'frozen', False):
@@ -4555,6 +4745,34 @@ QLineEdit:focus, QComboBox:focus {
 QScrollBar:vertical { width: 25px; background: #111111; }
 QScrollBar::handle:vertical { background: #666666; border-radius: 10px; }
 """.replace("%FONT%", APP_FONT)
+
+class UpdateSignals(QObject):
+    result = pyqtSignal(bool, str, str) # available, version, url/msg
+    finished = pyqtSignal()
+
+class UpdateWorker(QRunnable):
+    def __init__(self):
+        super().__init__()
+        self.signals = UpdateSignals()
+
+    def run(self):
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'M3UEditor'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                latest_tag = data.get("tag_name", "").lstrip("v")
+                html_url = data.get("html_url", "")
+                
+                # Basic version comparison
+                if latest_tag and latest_tag != APP_VERSION:
+                     self.signals.result.emit(True, latest_tag, html_url)
+                else:
+                     self.signals.result.emit(False, APP_VERSION, "You are up to date.")
+        except Exception as e:
+            self.signals.result.emit(False, "", str(e))
+        finally:
+            self.signals.finished.emit()
 
 class FirstRunWizard(QDialog):
     def __init__(self, settings, parent=None):
@@ -5173,133 +5391,159 @@ class M3UEditorWindow(QMainWindow):
         # Tools Menu
         tools_menu = menubar.addMenu("Tools")
         
+        # Deduplication Submenu
+        dedupe_menu = tools_menu.addMenu("Deduplication")
+        
         dup_action = QAction("Find Duplicates", self)
         dup_action.triggered.connect(self.find_duplicates)
-        tools_menu.addAction(dup_action)
+        dedupe_menu.addAction(dup_action)
         
         name_dup_action = QAction("Find Name Duplicates", self)
         name_dup_action.triggered.connect(self.find_name_duplicates)
-        tools_menu.addAction(name_dup_action)
+        dedupe_menu.addAction(name_dup_action)
         
         fuzzy_dup_action = QAction("Fuzzy Duplicate Finder...", self)
         fuzzy_dup_action.triggered.connect(self.find_fuzzy_duplicates)
-        tools_menu.addAction(fuzzy_dup_action)
+        dedupe_menu.addAction(fuzzy_dup_action)
+        
+        smart_dedupe_action = QAction("Smart Dedupe...", self)
+        smart_dedupe_action.triggered.connect(self.smart_dedupe)
+        dedupe_menu.addAction(smart_dedupe_action)
+        
+        # Organization Submenu
+        org_menu = tools_menu.addMenu("Organization")
+        
+        smart_group_action = QAction("Smart Grouping...", self)
+        smart_group_action.triggered.connect(self.smart_group_channels)
+        org_menu.addAction(smart_group_action)
+        
+        flag_action = QAction("Add Country Flags...", self)
+        flag_action.triggered.connect(self.add_country_flags)
+        org_menu.addAction(flag_action)
+        
+        chno_action = QAction("Channel Numbering Wizard...", self)
+        chno_action.triggered.connect(self.open_channel_numbering)
+        org_menu.addAction(chno_action)
+        
+        split_action = QAction("Split Playlist by Group...", self)
+        split_action.triggered.connect(self.split_playlist)
+        org_menu.addAction(split_action)
         
         fav_mgr_action = QAction("Favorites Manager...", self)
         fav_mgr_action.triggered.connect(self.open_favorites_manager)
-        tools_menu.addAction(fav_mgr_action)
+        org_menu.addAction(fav_mgr_action)
         
         ua_mgr_action = QAction("User-Agent Manager...", self)
         ua_mgr_action.triggered.connect(self.open_user_agent_manager)
-        tools_menu.addAction(ua_mgr_action)
+        org_menu.addAction(ua_mgr_action)
+        
+        lang_mgr_action = QAction("Language Manager...", self)
+        lang_mgr_action.triggered.connect(self.open_language_manager)
+        org_menu.addAction(lang_mgr_action)
+        
+        # Logos Submenu
+        logo_menu = tools_menu.addMenu("Logos")
+        
+        scrape_action = QAction("Scrape Missing Logos...", self)
+        scrape_action.triggered.connect(self.scrape_logos)
+        logo_menu.addAction(scrape_action)
+        
+        logo_wiz_action = QAction("Channel Logo Wizard...", self)
+        logo_wiz_action.triggered.connect(self.open_logo_wizard)
+        logo_menu.addAction(logo_wiz_action)
+        
+        # Diagnostics Submenu
+        diag_menu = tools_menu.addMenu("Diagnostics")
+        
+        stats_action = QAction("Channel Statistics...", self)
+        stats_action.triggered.connect(self.open_statistics)
+        diag_menu.addAction(stats_action)
+        
+        res_action = QAction("Check Resolutions", self)
+        res_action.triggered.connect(self.check_resolutions)
+        diag_menu.addAction(res_action)
+        
+        latency_action = QAction("Check Stream Latency", self)
+        latency_action.triggered.connect(self.check_latency)
+        diag_menu.addAction(latency_action)
+        
+        diag_action = QAction("Stream Diagnostics...", self)
+        diag_action.triggered.connect(self.open_stream_diagnostics)
+        diag_menu.addAction(diag_action)
+        
+        bitrate_action = QAction("Stream Bitrate Analyzer...", self)
+        bitrate_action.triggered.connect(self.open_bitrate_analyzer)
+        diag_menu.addAction(bitrate_action)
+        
+        monitor_action = QAction("Live Stream Monitor...", self)
+        monitor_action.triggered.connect(self.open_live_monitor)
+        diag_menu.addAction(monitor_action)
+        
+        diag_menu.addSeparator()
+        
+        invalid_action = QAction("Remove Invalid Streams", self)
+        invalid_action.triggered.connect(self.remove_invalid_streams)
+        diag_menu.addAction(invalid_action)
+        
+        repair_action = QAction("Auto-Repair Broken Streams", self)
+        repair_action.triggered.connect(self.auto_repair_streams)
+        diag_menu.addAction(repair_action)
+        
+        broken_report_action = QAction("Broken Link Reporter...", self)
+        broken_report_action.triggered.connect(self.generate_broken_report)
+        diag_menu.addAction(broken_report_action)
+        
+        # Network & Casting Submenu
+        net_menu = tools_menu.addMenu("Network && Casting")
+        
+        scanner_action = QAction("Network Stream Scanner...", self)
+        scanner_action.triggered.connect(self.open_network_scanner)
+        net_menu.addAction(scanner_action)
+        
+        cast_mgr_action = QAction("Cast Manager...", self)
+        cast_mgr_action.triggered.connect(self.open_cast_manager)
+        net_menu.addAction(cast_mgr_action)
+        
+        speed_action = QAction("Network Speed Test", self)
+        speed_action.triggered.connect(self.open_speed_test)
+        net_menu.addAction(speed_action)
+        
+        # Utilities Submenu
+        util_menu = tools_menu.addMenu("Utilities")
+        
+        trans_action = QAction("Quick Translate...", self)
+        trans_action.triggered.connect(self.open_quick_translate)
+        util_menu.addAction(trans_action)
+        
+        transcode_action = QAction("Transcode Wizard...", self)
+        transcode_action.triggered.connect(self.open_transcode_wizard)
+        util_menu.addAction(transcode_action)
+        
+        record_action = QAction("Schedule Recording...", self)
+        record_action.triggered.connect(self.open_scheduled_recording)
+        util_menu.addAction(record_action)
+        
+        diff_action = QAction("Playlist Diff Tool...", self)
+        diff_action.triggered.connect(self.open_playlist_diff)
+        util_menu.addAction(diff_action)
+        
+        gallery_action = QAction("Snapshot Gallery...", self)
+        gallery_action.triggered.connect(self.open_snapshot_gallery)
+        util_menu.addAction(gallery_action)
+        
+        epg_action = QAction("Update EPG Data...", self)
+        epg_action.triggered.connect(self.update_epg_data)
+        util_menu.addAction(epg_action)
+        
+        scheduler_action = QAction("Task Scheduler...", self)
+        scheduler_action.triggered.connect(self.open_task_scheduler)
+        util_menu.addAction(scheduler_action)
+        
+        tools_menu.addSeparator()
         
         pin_action = QAction("Set Parental PIN...", self)
         pin_action.triggered.connect(self.set_parental_pin)
         tools_menu.addAction(pin_action)
-        
-        lang_mgr_action = QAction("Language Manager...", self)
-        lang_mgr_action.triggered.connect(self.open_language_manager)
-        tools_menu.addAction(lang_mgr_action)
-        
-        trans_action = QAction("Quick Translate...", self)
-        trans_action.triggered.connect(self.open_quick_translate)
-        tools_menu.addAction(trans_action)
-        
-        smart_dedupe_action = QAction("Smart Dedupe...", self)
-        smart_dedupe_action.triggered.connect(self.smart_dedupe)
-        tools_menu.addAction(smart_dedupe_action)
-        
-        invalid_action = QAction("Remove Invalid Streams", self)
-        invalid_action.triggered.connect(self.remove_invalid_streams)
-        tools_menu.addAction(invalid_action)
-        
-        broken_report_action = QAction("Broken Link Reporter...", self)
-        broken_report_action.triggered.connect(self.generate_broken_report)
-        tools_menu.addAction(broken_report_action)
-        
-        chno_action = QAction("Channel Numbering Wizard...", self)
-        chno_action.triggered.connect(self.open_channel_numbering)
-        tools_menu.addAction(chno_action)
-        
-        repair_action = QAction("Auto-Repair Broken Streams", self)
-        repair_action.triggered.connect(self.auto_repair_streams)
-        tools_menu.addAction(repair_action)
-        
-        split_action = QAction("Split Playlist by Group...", self)
-        split_action.triggered.connect(self.split_playlist)
-        tools_menu.addAction(split_action)
-        
-        res_action = QAction("Check Resolutions", self)
-        res_action.triggered.connect(self.check_resolutions)
-        tools_menu.addAction(res_action)
-        
-        latency_action = QAction("Check Stream Latency", self)
-        latency_action.triggered.connect(self.check_latency)
-        tools_menu.addAction(latency_action)
-        
-        stats_action = QAction("Channel Statistics...", self)
-        stats_action.triggered.connect(self.open_statistics)
-        tools_menu.addAction(stats_action)
-        
-        epg_action = QAction("Update EPG Data...", self)
-        epg_action.triggered.connect(self.update_epg_data)
-        tools_menu.addAction(epg_action)
-        
-        smart_group_action = QAction("Smart Grouping...", self)
-        smart_group_action.triggered.connect(self.smart_group_channels)
-        tools_menu.addAction(smart_group_action)
-        
-        flag_action = QAction("Add Country Flags...", self)
-        flag_action.triggered.connect(self.add_country_flags)
-        tools_menu.addAction(flag_action)
-        
-        scrape_action = QAction("Scrape Missing Logos...", self)
-        scrape_action.triggered.connect(self.scrape_logos)
-        tools_menu.addAction(scrape_action)
-        
-        logo_wiz_action = QAction("Channel Logo Wizard...", self)
-        logo_wiz_action.triggered.connect(self.open_logo_wizard)
-        tools_menu.addAction(logo_wiz_action)
-        
-        transcode_action = QAction("Transcode Wizard...", self)
-        transcode_action.triggered.connect(self.open_transcode_wizard)
-        tools_menu.addAction(transcode_action)
-        
-        diag_action = QAction("Stream Diagnostics...", self)
-        diag_action.triggered.connect(self.open_stream_diagnostics)
-        tools_menu.addAction(diag_action)
-        
-        diff_action = QAction("Playlist Diff Tool...", self)
-        diff_action.triggered.connect(self.open_playlist_diff)
-        tools_menu.addAction(diff_action)
-        
-        gallery_action = QAction("Snapshot Gallery...", self)
-        gallery_action.triggered.connect(self.open_snapshot_gallery)
-        tools_menu.addAction(gallery_action)
-        
-        record_action = QAction("Schedule Recording...", self)
-        record_action.triggered.connect(self.open_scheduled_recording)
-        tools_menu.addAction(record_action)
-        
-        scanner_action = QAction("Network Stream Scanner...", self)
-        scanner_action.triggered.connect(self.open_network_scanner)
-        tools_menu.addAction(scanner_action)
-        
-        monitor_action = QAction("Live Stream Monitor...", self)
-        monitor_action.triggered.connect(self.open_live_monitor)
-        tools_menu.addAction(monitor_action)
-        
-        scheduler_action = QAction("Task Scheduler...", self)
-        scheduler_action.triggered.connect(self.open_task_scheduler)
-        tools_menu.addAction(scheduler_action)
-        
-        cast_mgr_action = QAction("Cast Manager...", self)
-        cast_mgr_action.triggered.connect(self.open_cast_manager)
-        tools_menu.addAction(cast_mgr_action)
-        
-        speed_action = QAction("Network Speed Test", self)
-        speed_action.triggered.connect(self.open_speed_test)
-        tools_menu.addAction(speed_action)
         
         settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.open_settings)
@@ -5329,6 +5573,23 @@ class M3UEditorWindow(QMainWindow):
         iptv_action.setShortcut("F11")
         iptv_action.triggered.connect(self.open_iptv_player)
         view_menu.addAction(iptv_action)
+        
+        # Help Menu
+        help_menu = menubar.addMenu("Help")
+        
+        doc_action = QAction("Documentation", self)
+        doc_action.triggered.connect(self.show_documentation)
+        help_menu.addAction(doc_action)
+        
+        update_action = QAction("Check for Updates", self)
+        update_action.triggered.connect(self.check_for_updates)
+        help_menu.addAction(update_action)
+        
+        help_menu.addSeparator()
+        
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
         
         # Plugins Menu
         plugins_menu = menubar.addMenu("Plugins")
@@ -6588,8 +6849,9 @@ class M3UEditorWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.status_label.setText(f"Checking resolution for {len(rows_to_check)} streams...")
         
+        ffprobe_bin = self.get_tool_path("ffprobe")
         for row, url in rows_to_check:
-            worker = ResolutionWorker(row, url)
+            worker = ResolutionWorker(row, url, ffprobe_bin)
             worker.signals.result.connect(self.on_resolution_found)
             self.thread_pool.start(worker)
             
@@ -7524,10 +7786,12 @@ class M3UEditorWindow(QMainWindow):
 
     def open_settings(self):
         current_path = self.settings.value("vlc_path", "")
-        dlg = SettingsDialog(self, current_path)
+        current_ffmpeg = self.settings.value("ffmpeg_dir", "")
+        dlg = SettingsDialog(self, current_path, current_ffmpeg)
         if dlg.exec():
             new_path = dlg.get_path()
             self.settings.setValue("vlc_path", new_path)
+            self.settings.setValue("ffmpeg_dir", dlg.get_ffmpeg_dir())
 
     def open_in_vlc(self):
         selected_rows = self.table.selectionModel().selectedRows()
@@ -7615,6 +7879,17 @@ class M3UEditorWindow(QMainWindow):
         dlg = SpeedTestDialog(self)
         dlg.exec()
 
+    def get_tool_path(self, tool_name):
+        """Resolves the path to a tool (ffmpeg/ffprobe) based on settings."""
+        ffmpeg_dir = self.settings.value("ffmpeg_dir", "")
+        if ffmpeg_dir and os.path.exists(ffmpeg_dir):
+            path = os.path.join(ffmpeg_dir, tool_name)
+            if sys.platform == "win32" and not path.endswith(".exe"):
+                path += ".exe"
+            if os.path.exists(path):
+                return path
+        return tool_name
+
     def open_transcode_wizard(self):
         selected_rows = self.get_selected_rows()
         if not selected_rows:
@@ -7644,7 +7919,8 @@ class M3UEditorWindow(QMainWindow):
                 ext = ".mp4" if fmt_idx == 0 else (".mkv" if fmt_idx == 1 else ".ts")
                 output_path = os.path.join(output_dir, f"{safe_name}{ext}")
                 
-                cmd = ["ffmpeg", "-y", "-i", entry.url]
+                ffmpeg_bin = self.get_tool_path("ffmpeg")
+                cmd = [ffmpeg_bin, "-y", "-i", entry.url]
                 if fmt_idx == 0: # MP4
                     cmd.extend(["-c:v", "libx264", "-preset", preset, "-c:a", "aac"])
                 else: # Copy
@@ -7680,7 +7956,8 @@ class M3UEditorWindow(QMainWindow):
             if delay_ms < 0:
                 delay_ms = 0 # Start immediately if in past
                 
-            cmd = ["ffmpeg", "-y", "-i", entry.url, "-t", str(duration_min * 60), "-c", "copy", output_file]
+            ffmpeg_bin = self.get_tool_path("ffmpeg")
+            cmd = [ffmpeg_bin, "-y", "-i", entry.url, "-t", str(duration_min * 60), "-c", "copy", output_file]
             
             def start_record():
                 self.status_label.setText(f"Recording started: {entry.name}")
@@ -7838,10 +8115,24 @@ class M3UEditorWindow(QMainWindow):
         dlg = StreamDiagnosticsDialog(self)
         dlg.show() # Non-blocking to allow worker to run
         
-        worker = DiagnosticsWorker(entry.url)
+        ffprobe_bin = self.get_tool_path("ffprobe")
+        worker = DiagnosticsWorker(entry.url, ffprobe_bin)
         worker.signals.result.connect(dlg.populate_data)
         worker.signals.error.connect(dlg.show_error)
         self.thread_pool.start(worker)
+
+    def open_bitrate_analyzer(self):
+        selected_rows = self.get_selected_rows()
+        if not selected_rows:
+            QMessageBox.warning(self, "Warning", "Please select a stream to analyze.")
+            return
+            
+        idx = self.proxy_model.mapToSource(selected_rows[0])
+        entry = self.entries[idx.row()]
+        
+        ffmpeg_bin = self.get_tool_path("ffmpeg")
+        dlg = BitrateAnalyzerDialog(entry.url, self, ffmpeg_bin)
+        dlg.exec()
 
     def open_toolbar_customizer(self):
         current = self.settings.value("quick_access_actions", ["save", "validate", "cast", "diagnostics"])
@@ -8058,6 +8349,37 @@ class M3UEditorWindow(QMainWindow):
         else:
             subprocess.Popen(['xdg-open', path])
 
+    def show_documentation(self):
+        webbrowser.open(f"https://github.com/{GITHUB_REPO}")
+
+    def show_about(self):
+        QMessageBox.about(self, "About Open Source M3U Editor",
+                          f"<b>Open Source M3U Editor</b> v{APP_VERSION}<br><br>"
+                          "A robust tool for managing M3U playlists.<br>"
+                          "Created by Kamal.")
+
+    def check_for_updates(self):
+        self.status_label.setText("Checking for updates...")
+        worker = UpdateWorker()
+        worker.signals.result.connect(self.on_update_result)
+        self.thread_pool.start(worker)
+
+    def on_update_result(self, available, version, data):
+        self.status_label.setText("Ready")
+        if available:
+            reply = QMessageBox.question(self, "Update Available",
+                                         f"A new version ({version}) is available.\n"
+                                         "Do you want to view the release page?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                webbrowser.open(data)
+        else:
+            if version: # Check was successful but no update
+                QMessageBox.information(self, "Check for Updates", f"No updates available.\nCurrent version: {version}")
+            else: # Error
+                logging.error(f"Update check failed: {data}")
+                QMessageBox.warning(self, "Check for Updates", f"Failed to check for updates:\n{data}")
+
 # -----------------------------------------------------------------------------
 # Main Execution
 # -----------------------------------------------------------------------------
@@ -8069,6 +8391,6 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     
     window = M3UEditorWindow()
-    window.show()
+    window.showMaximized()
     
     sys.exit(app.exec())
