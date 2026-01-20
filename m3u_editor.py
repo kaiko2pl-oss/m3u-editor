@@ -5880,10 +5880,6 @@ class M3UEditorWindow(QMainWindow):
         # Help Menu
         help_menu = menubar.addMenu("Help")
         
-        doc_action = QAction("Documentation", self)
-        doc_action.triggered.connect(self.show_documentation)
-        help_menu.addAction(doc_action)
-        
         update_action = QAction("Check for Updates", self)
         update_action.triggered.connect(self.check_for_updates)
         help_menu.addAction(update_action)

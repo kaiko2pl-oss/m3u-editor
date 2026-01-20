@@ -202,7 +202,6 @@ pip install PyQt6 pychromecast qrcode[pil] deep-translator
 *   *(Loaded Plugins)*: Custom actions defined by external scripts.
 
 #### **Help Menu**
-*   **Documentation**: Open the online documentation.
 *   **Check for Updates**: Check for the latest version on GitHub.
 *   **About**: View application version and credits.
 
